@@ -5,6 +5,7 @@ import os
 import re
 import subprocess
 import tempfile
+import time
 from pathlib import Path
 from datetime import datetime
 from mcp.server import Server
@@ -14,8 +15,39 @@ from mcp import types
 CURRENT = Path(__file__).parent / "transcripts" / "meeting_transcript.txt"
 TRANSCRIPTS_DIR = Path(__file__).parent / "transcripts"
 MINDNODE_TMP = Path("/tmp/mindnode-mcp")
+FRESHNESS_THRESHOLD = 180  # seconds — if file not updated in 3 min, it's stale
 
 server = Server("meeting-transcript")
+
+
+def _is_recording_live() -> bool:
+    """Check if the transcript file is being actively written (updated within threshold)."""
+    try:
+        target = CURRENT.resolve() if CURRENT.is_symlink() else CURRENT
+        if not target.exists():
+            return False
+        age = time.time() - target.stat().st_mtime
+        return age < FRESHNESS_THRESHOLD
+    except Exception:
+        return False
+
+
+def _freshness_note() -> str:
+    """Return a warning prefix if the transcript is stale (not from an active recording)."""
+    if _is_recording_live():
+        return ""
+    try:
+        target = CURRENT.resolve() if CURRENT.is_symlink() else CURRENT
+        if not target.exists():
+            return ""
+        mtime = datetime.fromtimestamp(target.stat().st_mtime)
+        return (
+            f"⚠️ RECORDING IS NOT ACTIVE. This is a transcript from a PAST meeting "
+            f"(file: {target.name}, last updated: {mtime.strftime('%Y-%m-%d %H:%M')}). "
+            f"Do NOT refer to it as the 'current meeting'.\n\n"
+        )
+    except Exception:
+        return ""
 
 
 def read_transcript_text() -> str:
@@ -143,8 +175,9 @@ async def call_tool(name: str, arguments: dict):
             text = read_transcript_text()
             if not text:
                 return [types.TextContent(type="text", text="Транскрипт пуст — запись ещё не началась или нет аудио.")]
+            note = _freshness_note()
             return [types.TextContent(type="text", text=(
-                f"Вот транскрипт встречи. Структурируй его как Markdown outline "
+                f"{note}Вот транскрипт встречи. Структурируй его как Markdown outline "
                 f"и вызови create_conference_map снова с параметром outline:\n\n{text}"
             ))]
 
@@ -168,7 +201,8 @@ async def call_tool(name: str, arguments: dict):
             keep = max(1, int(last_minutes * 2))
             text = "\n".join(lines[-keep:] if len(lines) > keep else lines)
 
-        return [types.TextContent(type="text", text=text)]
+        note = _freshness_note()
+        return [types.TextContent(type="text", text=note + text)]
 
     elif name == "list_past_meetings":
         if not TRANSCRIPTS_DIR.exists():

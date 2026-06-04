@@ -157,6 +157,47 @@ else
 fi
 ok "Claude Desktop configured"
 
+# ── 10. LaunchAgent — auto-start watcher on login ────────────────────────────
+say "Setting up watcher auto-start (LaunchAgent)..."
+PLIST_PATH="$HOME/Library/LaunchAgents/com.meeting-transcript.watcher.plist"
+WATCHER_LOG="$INSTALL_DIR/watcher.log"
+
+cat > "$PLIST_PATH" << PLISTEOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.meeting-transcript.watcher</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>$VENV_PY</string>
+        <string>$INSTALL_DIR/watcher.py</string>
+    </array>
+    <key>WorkingDirectory</key>
+    <string>$INSTALL_DIR</string>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>$WATCHER_LOG</string>
+    <key>StandardErrorPath</key>
+    <string>$WATCHER_LOG</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin</string>
+    </dict>
+</dict>
+</plist>
+PLISTEOF
+
+# Load the agent (unload first if exists)
+launchctl bootout "gui/$(id -u)/com.meeting-transcript.watcher" 2>/dev/null || true
+launchctl bootstrap "gui/$(id -u)" "$PLIST_PATH" 2>/dev/null || launchctl load "$PLIST_PATH" 2>/dev/null
+ok "Watcher auto-start configured (survives reboot)"
+
 # ── Done ─────────────────────────────────────────────────────────────────────
 cat << SUMMARY
 
@@ -178,18 +219,17 @@ cat << SUMMARY
   │     bash $INSTALL_DIR/setup-audio.sh                       │
   └──────────────────────────────────────────────────────────┘
 
-  🚀 Usage:
-
-  Auto mode (starts when Zoom meeting detected):
-    $VENV_PY $INSTALL_DIR/watcher.py
-
-  Manual mode:
-    $VENV_PY $INSTALL_DIR/capture.py
+  Watcher is running as a LaunchAgent — it auto-starts on login
+  and auto-detects Zoom meetings. No manual launch needed.
 
   Transcripts saved to: $INSTALL_DIR/transcripts/
 
   In Claude Desktop (after Cmd+Q → reopen):
-    "что обсуждали на встрече?" — читает транскрипт
-    "покажи карту конференции"  — mind map
+    "what was discussed?" — reads transcript
+    "show conference map" — builds mind map
+
+  Diagnostics:
+    launchctl list | grep meeting-transcript
+    tail -20 $INSTALL_DIR/watcher.log
 
 SUMMARY
