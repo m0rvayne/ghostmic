@@ -31,11 +31,11 @@ if [[ "${BASH_SOURCE[0]}" == "" ]] || [[ ! -f "$(dirname "${BASH_SOURCE[0]}")/ca
     say "Downloading repository..."
     REPO_DIR="/tmp/meeting-transcript-mcp-$$"
     if command -v git &>/dev/null; then
-        git clone --depth 1 https://github.com/morvayne1/meeting-transcript-mcp.git "$REPO_DIR" 2>&1 | tail -1
+        git clone --depth 1 https://github.com/m0rvayne/meeting-transcript-mcp.git "$REPO_DIR" 2>&1 | tail -1
     else
         # No git yet — use curl + tar from GitHub
         mkdir -p "$REPO_DIR"
-        curl -fsSL https://github.com/morvayne1/meeting-transcript-mcp/archive/refs/heads/main.tar.gz \
+        curl -fsSL https://github.com/m0rvayne/meeting-transcript-mcp/archive/refs/heads/main.tar.gz \
             | tar -xz -C "$REPO_DIR" --strip-components=1
     fi
     ok "Downloaded to $REPO_DIR"
@@ -100,7 +100,7 @@ fi
 # ── 4. Copy files ────────────────────────────────────────────────────────────
 say "Installing to $INSTALL_DIR..."
 mkdir -p "$INSTALL_DIR/transcripts"
-for f in server.py capture.py watcher.py setup-audio.sh requirements.txt; do
+for f in server.py capture.py watcher.py setup-audio.sh requirements.txt update.sh; do
     [[ -f "$SCRIPT_DIR/$f" ]] && cp "$SCRIPT_DIR/$f" "$INSTALL_DIR/"
 done
 chmod +x "$INSTALL_DIR/setup-audio.sh" 2>/dev/null || true

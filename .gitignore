@@ -1,1 +1,10 @@
 __pycache__/
+*.pyc
+*.pyo
+.venv/
+*.egg-info/
+dist/
+build/
+transcripts/
+watcher.log
+.DS_Store
