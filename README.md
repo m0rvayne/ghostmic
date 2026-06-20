@@ -5,7 +5,9 @@
 [![License: MIT](https://img.shields.io/badge/license-MIT-yellow)](LICENSE)
 [![MCP](https://img.shields.io/badge/protocol-MCP-purple)](https://modelcontextprotocol.io)
 
-Live Zoom transcription for Claude. Records system audio via BlackHole, transcribes locally with Whisper AI, serves transcripts through MCP.
+Live meeting transcript for Claude. Records Zoom audio via BlackHole, transcribes locally with Whisper AI, delivers the text to Claude in real time through MCP.
+
+Claude knows what you're discussing right now. Ask follow-up questions, get summaries, search past meetings — all without leaving the conversation.
 
 > **Currently supports Zoom.** Google Meet and Teams support is planned.
 
@@ -60,12 +62,13 @@ tail -20 ~/.meeting-transcript-mcp/watcher.log
 ~/.meeting-transcript-mcp/.venv/bin/python3 ~/.meeting-transcript-mcp/capture.py
 ```
 
-**In Claude Desktop** (restart first with Cmd+Q):
+**In Claude** (restart Desktop with Cmd+Q first):
 
-- "what was discussed?" — reads current transcript
-- "show conference map" — builds a mind map in MindNode
-- "list past meetings" — shows all recorded sessions
-- "read meeting from 2026-06-20" — opens a specific past transcript
+- "what are they talking about?" — live transcript of the current meeting
+- "summarize the last 10 minutes" — filtered view
+- "list past meetings" — all recorded sessions
+- "search meetings for 'budget'" — find specific discussions
+- "get status" — check if recording is active
 
 Transcripts are saved to `~/.meeting-transcript-mcp/transcripts/`.
 
@@ -74,6 +77,14 @@ Transcripts are saved to `~/.meeting-transcript-mcp/transcripts/`.
 ```bash
 cd meeting-transcript-mcp && bash update.sh
 ```
+
+## Uninstall
+
+```bash
+bash uninstall.sh
+```
+
+Removes the daemon, venv, and Claude Desktop config. Asks before deleting saved transcripts.
 
 ## Switching headphones
 

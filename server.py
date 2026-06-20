@@ -1,10 +1,10 @@
 """
-MCP server: live meeting transcript + conference map generator.
+MCP server: live meeting transcript for Claude.
+Captures Zoom audio, transcribes locally with Whisper, serves to Claude in real time.
 """
 import os
 import re
 import shutil
-import subprocess
 import time
 from pathlib import Path
 from datetime import datetime
@@ -15,11 +15,9 @@ from mcp import types
 INSTALL_DIR = Path(__file__).parent
 CURRENT = INSTALL_DIR / "transcripts" / "meeting_transcript.txt"
 TRANSCRIPTS_DIR = INSTALL_DIR / "transcripts"
-MINDNODE_TMP = Path("/tmp/mindnode-mcp")
 PID_FILE = INSTALL_DIR / "watcher.pid"
 FRESHNESS_THRESHOLD = 180  # seconds
 MAX_TRANSCRIPT_BYTES = 50 * 1024 * 1024  # 50 MB
-MAX_OUTLINE_BYTES = 1024 * 1024  # 1 MB
 MAX_PAST_MEETINGS = 200
 MAX_SEARCH_RESULTS = 20
 
@@ -32,7 +30,6 @@ def _resolve_transcript() -> Path | None:
         target = CURRENT.resolve() if CURRENT.is_symlink() else CURRENT
         if not target.exists():
             return None
-        # Boundary check — symlink must point within transcripts dir
         if not target.is_relative_to(TRANSCRIPTS_DIR.resolve()):
             return None
         return target
@@ -66,10 +63,10 @@ def _safe_transcript_path(filename: str) -> Path | None:
     """Resolve filename and ensure it stays within TRANSCRIPTS_DIR. Rejects symlinks."""
     if not filename or "/" in filename or "\\" in filename or ".." in filename:
         return None
-    if "%" in filename:  # reject URL-encoded paths
+    if "%" in filename:
         return None
     candidate = TRANSCRIPTS_DIR / filename
-    if candidate.is_symlink():  # reject symlinks as defense-in-depth
+    if candidate.is_symlink():
         return None
     path = candidate.resolve()
     if not path.is_relative_to(TRANSCRIPTS_DIR.resolve()):
@@ -90,7 +87,7 @@ def read_transcript_text() -> str:
 
 def _filter_by_minutes(text: str, last_minutes: float) -> str:
     """Filter transcript lines to only include the last N minutes based on timestamps."""
-    if not (last_minutes and last_minutes > 0 and last_minutes == last_minutes):  # handles NaN
+    if not (last_minutes and last_minutes > 0 and last_minutes == last_minutes):
         return text
 
     lines = [l for l in text.split("\n") if l.strip()]
@@ -125,26 +122,6 @@ def _filter_by_minutes(text: str, last_minutes: float) -> str:
                 result.append(line)
 
     return "\n".join(result) if result else "\n".join(lines[-3:])
-
-
-def open_in_mindnode(outline: str, title: str) -> str:
-    if len(outline.encode("utf-8")) > MAX_OUTLINE_BYTES:
-        raise ValueError("Outline too large (max 1 MB)")
-
-    MINDNODE_TMP.mkdir(parents=True, exist_ok=True)
-    # Clean up old files
-    for old in MINDNODE_TMP.glob("*.md"):
-        try:
-            if time.time() - old.stat().st_mtime > 3600:
-                old.unlink()
-        except Exception:
-            pass
-
-    safe_title = re.sub(r'[^a-zA-Zа-яА-ЯёЁ0-9_ -]', '_', title)[:100]
-    filepath = MINDNODE_TMP / f"{safe_title}.md"
-    filepath.write_text(outline, encoding="utf-8")
-    subprocess.run(["open", "-a", "MindNode", str(filepath)], timeout=10)
-    return str(filepath)
 
 
 # -- Resources ----------------------------------------------------------------
@@ -202,33 +179,11 @@ async def read_resource(uri):
 async def list_tools():
     return [
         types.Tool(
-            name="create_conference_map",
-            description=(
-                "Build a mind map from the meeting transcript and open it in MindNode. "
-                "Trigger phrases: 'conference map', 'meeting map', 'mind map', "
-                "'карта встречи', 'карта конференции', 'карта совещания'. "
-                "Read the transcript first, then call this tool with a Markdown outline. "
-                "Use adaptive heading depth (# through ######) based on content complexity. "
-                "Each node: noun phrase, preserve names/numbers/dates. "
-                "Go deeper when a node has 3+ distinct sub-points, comparisons, or decision chains. "
-                "Stay shallow for simple enumerations or briefly mentioned topics."
-            ),
-            inputSchema={
-                "type": "object",
-                "required": ["outline", "title"],
-                "properties": {
-                    "title": {"type": "string", "description": "Mind map title"},
-                    "outline": {"type": "string", "description": "Full Markdown outline with adaptive heading depth"},
-                },
-            },
-        ),
-        types.Tool(
             name="read_meeting_transcript",
             description=(
                 "Read the current live meeting transcript. "
                 "Use when asked: 'what was discussed', 'summarize the meeting', "
-                "'что обсуждали', 'итоги встречи'. "
-                "For mind map requests use create_conference_map instead."
+                "'что обсуждали', 'итоги встречи', 'what are they talking about'."
             ),
             inputSchema={
                 "type": "object",
@@ -290,27 +245,7 @@ async def list_tools():
 async def call_tool(name: str, arguments: dict | None):
     arguments = arguments or {}
 
-    if name == "create_conference_map":
-        outline = arguments.get("outline", "")
-        title = arguments.get("title", f"Meeting {datetime.now().strftime('%d.%m.%Y')}")
-
-        if not outline:
-            text = read_transcript_text()
-            if not text:
-                return [types.TextContent(type="text", text="Transcript is empty — recording has not started or no audio detected.")]
-            note = _freshness_note()
-            return [types.TextContent(type="text", text=(
-                f"{note}Here is the meeting transcript. Structure it as a Markdown outline "
-                f"and call create_conference_map again with the 'outline' parameter:\n\n{text}"
-            ))]
-
-        try:
-            open_in_mindnode(outline, title)
-            return [types.TextContent(type="text", text=f"Map '{title}' opened in MindNode.")]
-        except Exception:
-            return [types.TextContent(type="text", text="Failed to open in MindNode. Is MindNode installed?")]
-
-    elif name == "read_meeting_transcript":
+    if name == "read_meeting_transcript":
         text = read_transcript_text()
         if not text:
             return [types.TextContent(type="text", text="Transcript is empty.")]
@@ -320,7 +255,7 @@ async def call_tool(name: str, arguments: dict | None):
             try:
                 text = _filter_by_minutes(text, float(last_minutes))
             except (ValueError, TypeError):
-                pass  # ignore invalid values, return full transcript
+                pass
 
         note = _freshness_note()
         return [types.TextContent(type="text", text=note + text)]
@@ -366,7 +301,6 @@ async def call_tool(name: str, arguments: dict | None):
             if query.lower() not in content.lower():
                 continue
 
-            # Extract matching lines with context
             lines = content.split("\n")
             matches = []
             for i, line in enumerate(lines):
@@ -387,12 +321,11 @@ async def call_tool(name: str, arguments: dict | None):
     elif name == "get_status":
         status_parts = []
 
-        # Watcher status
         watcher_running = False
         if PID_FILE.exists():
             try:
                 pid = int(PID_FILE.read_text().strip())
-                os.kill(pid, 0)  # check if alive
+                os.kill(pid, 0)
                 watcher_running = True
                 status_parts.append(f"Watcher: running (PID {pid})")
             except (ValueError, ProcessLookupError, PermissionError):
@@ -400,14 +333,12 @@ async def call_tool(name: str, arguments: dict | None):
         else:
             status_parts.append("Watcher: not running (no PID file)")
 
-        # Recording status
         if _is_recording_live():
             target = _resolve_transcript()
             status_parts.append(f"Recording: ACTIVE ({target.name if target else 'unknown'})")
         else:
             status_parts.append("Recording: inactive")
 
-        # Transcript stats
         if TRANSCRIPTS_DIR.exists():
             txt_files = [f for f in TRANSCRIPTS_DIR.glob("*.txt")
                          if f.name != "meeting_transcript.txt" and not f.is_symlink()]
@@ -416,7 +347,6 @@ async def call_tool(name: str, arguments: dict | None):
         else:
             status_parts.append("Transcripts: none")
 
-        # Disk space
         try:
             usage = shutil.disk_usage(TRANSCRIPTS_DIR.parent)
             free_gb = usage.free / (1024 ** 3)

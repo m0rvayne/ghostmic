@@ -21,7 +21,6 @@ def setup_dirs(tmp_path):
         "server",
         TRANSCRIPTS_DIR=_transcripts,
         CURRENT=_transcripts / "meeting_transcript.txt",
-        MINDNODE_TMP=tmp_path / "mindnode",
     ):
         yield
 
@@ -197,19 +196,6 @@ class TestReadTranscriptText:
              patch("server.TRANSCRIPTS_DIR", _transcripts):
             text = server.read_transcript_text()
         assert text == ""
-
-
-class TestOpenInMindnode:
-    def test_outline_too_large(self):
-        with patch("server.MAX_OUTLINE_BYTES", 100):
-            with pytest.raises(ValueError, match="too large"):
-                server.open_in_mindnode("x" * 200, "test")
-
-    def test_title_sanitization(self):
-        with patch("server.MINDNODE_TMP", _tmpdir / "mindnode"), \
-             patch("subprocess.run"):
-            path = server.open_in_mindnode("# Test", "Hello/World<>|")
-        assert "/" not in Path(path).name or "mindnode" in path
 
 
 class TestCallTool:

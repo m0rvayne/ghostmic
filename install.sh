@@ -257,8 +257,8 @@ cat << SUMMARY
   Transcripts saved to: $INSTALL_DIR/transcripts/
 
   In Claude Desktop (after Cmd+Q → reopen):
-    "what was discussed?" — reads transcript
-    "show conference map" — builds mind map
+    "what are they talking about?" — live transcript
+    "summarize the last 10 minutes" — filtered recap
 
   Diagnostics:
     launchctl list | grep meeting-transcript
