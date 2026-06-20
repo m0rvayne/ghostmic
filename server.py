@@ -226,8 +226,7 @@ If no action items, write "No action items were identified."
 ---
 
 TRANSCRIPT:
-
-{transcript}"""
+"""
 
 
 @server.list_prompts()
@@ -263,6 +262,8 @@ async def get_prompt(name: str, arguments: dict | None):
         path = _safe_transcript_path(filename)
         if not path:
             raise ValueError(f"Transcript not found: {filename}")
+        if path.stat().st_size > MAX_TRANSCRIPT_BYTES:
+            raise ValueError("Transcript too large for meeting notes.")
         transcript = path.read_text(encoding="utf-8", errors="replace")
     else:
         transcript = read_transcript_text()
@@ -278,7 +279,7 @@ async def get_prompt(name: str, arguments: dict | None):
                 role="user",
                 content=types.TextContent(
                     type="text",
-                    text=note + MEETING_NOTES_TEMPLATE.format(transcript=transcript),
+                    text=note + MEETING_NOTES_TEMPLATE + "\n" + transcript,
                 ),
             ),
         ],

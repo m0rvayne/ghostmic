@@ -355,10 +355,11 @@ def writer_thread(model, has_mic: bool):
 
                 if text:
                     # Speaker diarization: label [You] vs [Remote] using pre-mix channels
+                    # Use padded arrays so both channels have equal length
                     if ENABLE_DIARIZATION and audio_mic_raw is not None:
                         try:
-                            segments = _classify_speakers(audio_bh, audio_mic_raw)
-                            text = _build_diarized_text(text, segments, len(audio_bh))
+                            segments = _classify_speakers(audio_bh_padded, audio_mic_padded)
+                            text = _build_diarized_text(text, segments, len(audio_bh_padded))
                         except Exception:
                             pass  # fall back to unlabeled text
                     line = f"[{format_time(chunk_start)}-{format_time(chunk_end)}] {text}\n"
@@ -380,14 +381,22 @@ def writer_thread(model, has_mic: bool):
         # Flush remaining buffers (both bh and mic)
         if buffer_bh:
             audio = np.concatenate(buffer_bh).flatten().astype(np.float32)
+            flush_mic_padded = None
+            flush_bh_padded = audio
             if has_mic and buffer_mic:
                 mic_audio = np.concatenate(buffer_mic).flatten().astype(np.float32)
                 max_len = max(len(audio), len(mic_audio))
-                audio = np.pad(audio, (0, max(0, max_len - len(audio))))
-                mic_audio = np.pad(mic_audio, (0, max(0, max_len - len(mic_audio))))
-                audio = np.clip((audio + mic_audio) * 0.5, -1.0, 1.0)
+                flush_bh_padded = np.pad(audio, (0, max(0, max_len - len(audio))))
+                flush_mic_padded = np.pad(mic_audio, (0, max(0, max_len - len(mic_audio))))
+                audio = np.clip((flush_bh_padded + flush_mic_padded) * 0.5, -1.0, 1.0)
             text = transcribe_chunk(model, audio)
             if text:
+                if ENABLE_DIARIZATION and flush_mic_padded is not None:
+                    try:
+                        segments = _classify_speakers(flush_bh_padded, flush_mic_padded)
+                        text = _build_diarized_text(text, segments, len(flush_bh_padded))
+                    except Exception:
+                        pass
                 _write_transcript(TRANSCRIPT_FILE,
                     f"[{format_time(chunk_start)}-{format_time(datetime.now())}] {text}\n")
         print("[meeting] Done.", flush=True)
