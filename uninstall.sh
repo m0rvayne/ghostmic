@@ -31,7 +31,9 @@ ok "LaunchAgent removed"
 # 2. Remove MCP entry from Claude Desktop config
 if [[ -f "$CLAUDE_CONFIG" ]]; then
     say "Removing MCP config from Claude Desktop..."
-    python3 -c "
+    UNINSTALL_PY="${INSTALL_DIR}/.venv/bin/python3"
+    [[ ! -x "$UNINSTALL_PY" ]] && UNINSTALL_PY="python3"
+    "$UNINSTALL_PY" -c "
 import json, sys
 try:
     with open('$CLAUDE_CONFIG') as f: config = json.load(f)

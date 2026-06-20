@@ -143,8 +143,12 @@ def start_capture():
     _crash_times[:] = [t for t in _crash_times if now - t < CRASH_WINDOW]
     if len(_crash_times) >= MAX_RAPID_CRASHES:
         log(f"capture.py crashed {MAX_RAPID_CRASHES} times in {CRASH_WINDOW}s — backing off 60s")
-        time.sleep(60)
         _crash_times.clear()
+        # Non-blocking backoff — check running flag every second
+        for _ in range(60):
+            if not running:
+                return
+            time.sleep(1)
 
     # Always start a fresh transcript for a new meeting
     timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
@@ -201,8 +205,8 @@ def stop_capture():
 
 def notify(title: str, message: str):
     """macOS notification with proper escaping."""
-    safe_title = title.replace('"', '\\"').replace("\\", "\\\\")
-    safe_msg = message.replace('"', '\\"').replace("\\", "\\\\")
+    safe_title = title.replace("\\", "\\\\").replace('"', '\\"')
+    safe_msg = message.replace("\\", "\\\\").replace('"', '\\"')
     try:
         subprocess.run(
             ["osascript", "-e",

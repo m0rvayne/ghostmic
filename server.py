@@ -61,19 +61,22 @@ def _freshness_note() -> str:
 
 def _safe_transcript_path(filename: str) -> Path | None:
     """Resolve filename and ensure it stays within TRANSCRIPTS_DIR. Rejects symlinks."""
-    if not filename or "/" in filename or "\\" in filename or ".." in filename:
+    try:
+        if not filename or "/" in filename or "\\" in filename or ".." in filename:
+            return None
+        if "%" in filename or "\x00" in filename:
+            return None
+        candidate = TRANSCRIPTS_DIR / filename
+        if candidate.is_symlink():
+            return None
+        path = candidate.resolve()
+        if not path.is_relative_to(TRANSCRIPTS_DIR.resolve()):
+            return None
+        if not path.exists():
+            return None
+        return path
+    except (ValueError, OSError):
         return None
-    if "%" in filename:
-        return None
-    candidate = TRANSCRIPTS_DIR / filename
-    if candidate.is_symlink():
-        return None
-    path = candidate.resolve()
-    if not path.is_relative_to(TRANSCRIPTS_DIR.resolve()):
-        return None
-    if not path.exists():
-        return None
-    return path
 
 
 def read_transcript_text() -> str:
@@ -82,7 +85,10 @@ def read_transcript_text() -> str:
         return ""
     if target.stat().st_size > MAX_TRANSCRIPT_BYTES:
         return "[Transcript too large to read in full]"
-    return target.read_text(encoding="utf-8").strip()
+    try:
+        return target.read_text(encoding="utf-8", errors="replace").strip()
+    except OSError:
+        return ""
 
 
 def _filter_by_minutes(text: str, last_minutes: float) -> str:
@@ -168,7 +174,7 @@ async def read_resource(uri):
             return "File not found."
         if path.stat().st_size > MAX_TRANSCRIPT_BYTES:
             return "Transcript too large."
-        return path.read_text(encoding="utf-8")
+        return path.read_text(encoding="utf-8", errors="replace")
 
     return "Unknown resource."
 
@@ -278,7 +284,7 @@ async def call_tool(name: str, arguments: dict | None):
             return [types.TextContent(type="text", text="File not found or invalid filename.")]
         if path.stat().st_size > MAX_TRANSCRIPT_BYTES:
             return [types.TextContent(type="text", text="Transcript too large to read.")]
-        return [types.TextContent(type="text", text=path.read_text(encoding="utf-8"))]
+        return [types.TextContent(type="text", text=path.read_text(encoding="utf-8", errors="replace"))]
 
     elif name == "search_transcripts":
         query = arguments.get("query", "").strip()
@@ -314,8 +320,8 @@ async def call_tool(name: str, arguments: dict | None):
                 break
 
         if not results:
-            return [types.TextContent(type="text", text=f"No matches found for '{query}'.")]
-        header = f"Found '{query}' in {len(results)} meeting(s):\n\n"
+            return [types.TextContent(type="text", text=f"No matches found for '{query[:200]}'.")]
+        header = f"Found '{query[:200]}' in {len(results)} meeting(s):\n\n"
         return [types.TextContent(type="text", text=header + "\n\n".join(results))]
 
     elif name == "get_status":
@@ -325,10 +331,13 @@ async def call_tool(name: str, arguments: dict | None):
         if PID_FILE.exists():
             try:
                 pid = int(PID_FILE.read_text().strip())
-                os.kill(pid, 0)
-                watcher_running = True
-                status_parts.append(f"Watcher: running (PID {pid})")
-            except (ValueError, ProcessLookupError, PermissionError):
+                if pid > 0:
+                    os.kill(pid, 0)
+                    watcher_running = True
+                    status_parts.append(f"Watcher: running (PID {pid})")
+                else:
+                    status_parts.append("Watcher: not running")
+            except (ValueError, ProcessLookupError, PermissionError, OverflowError, OSError):
                 status_parts.append("Watcher: not running")
         else:
             status_parts.append("Watcher: not running (no PID file)")

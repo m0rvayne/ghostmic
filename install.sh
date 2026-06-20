@@ -168,8 +168,12 @@ config_path = "$CLAUDE_CONFIG"
 venv_py = "$VENV_PY"
 server_py = "$INSTALL_DIR/server.py"
 
-with open(config_path) as f:
-    config = json.load(f)
+try:
+    with open(config_path) as f:
+        config = json.load(f)
+except (json.JSONDecodeError, ValueError):
+    print("  Existing config was malformed — creating fresh config")
+    config = {}
 
 config.setdefault("mcpServers", {})
 config["mcpServers"]["meeting-transcript"] = {

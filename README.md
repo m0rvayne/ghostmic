@@ -9,6 +9,8 @@ Live meeting transcript for Claude. Records Zoom audio via BlackHole, transcribe
 
 Claude knows what you're discussing right now. Ask follow-up questions, get summaries, search past meetings — all without leaving the conversation.
 
+> **macOS only.** Requires macOS 12+ (BlackHole audio driver, CoreAudio, LaunchAgent). Windows and Linux are not supported.
+
 > **Currently supports Zoom.** Google Meet and Teams support is planned.
 
 ## Architecture

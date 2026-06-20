@@ -31,7 +31,7 @@ fi
 
 # Copy all project files (not just a hardcoded list)
 UPDATED=0
-for f in "$SCRIPT_DIR"/*.py "$SCRIPT_DIR"/*.sh "$SCRIPT_DIR"/requirements.txt; do
+for f in "$SCRIPT_DIR"/*.py "$SCRIPT_DIR"/*.sh "$SCRIPT_DIR"/*.swift "$SCRIPT_DIR"/requirements.txt; do
     [[ ! -f "$f" ]] && continue
     fname="$(basename "$f")"
     [[ "$fname" == "install.sh" ]] && continue  # don't overwrite install.sh in install dir
