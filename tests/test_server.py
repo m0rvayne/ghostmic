@@ -255,3 +255,52 @@ class TestListPastMeetings:
             result = _run(server.call_tool("list_past_meetings", {}))
         lines = [l for l in result[0].text.split("\n") if l.strip().startswith("-")]
         assert len(lines) == 3
+
+
+class TestSearchTranscripts:
+    def test_finds_matching_content(self):
+        (_transcripts / "meeting_a.txt").write_text("[14:00:00-14:00:30] We discussed the budget for Q3\n")
+        (_transcripts / "meeting_b.txt").write_text("[14:00:00-14:00:30] Sprint planning session\n")
+        with patch("server.TRANSCRIPTS_DIR", _transcripts):
+            result = _run(server.call_tool("search_transcripts", {"query": "budget"}))
+        assert "budget" in result[0].text.lower()
+        assert "meeting_a.txt" in result[0].text
+        assert "meeting_b.txt" not in result[0].text
+
+    def test_case_insensitive(self):
+        (_transcripts / "meeting.txt").write_text("[14:00:00-14:00:30] The API launch is scheduled\n")
+        with patch("server.TRANSCRIPTS_DIR", _transcripts):
+            result = _run(server.call_tool("search_transcripts", {"query": "api"}))
+        assert "API" in result[0].text
+
+    def test_no_results(self):
+        (_transcripts / "meeting.txt").write_text("[14:00:00-14:00:30] Nothing relevant here\n")
+        with patch("server.TRANSCRIPTS_DIR", _transcripts):
+            result = _run(server.call_tool("search_transcripts", {"query": "xyznonexistent"}))
+        assert "No matches" in result[0].text
+
+    def test_empty_query(self):
+        with patch("server.TRANSCRIPTS_DIR", _transcripts):
+            result = _run(server.call_tool("search_transcripts", {"query": ""}))
+        assert "Empty" in result[0].text
+
+
+class TestGetStatus:
+    def test_returns_status_info(self):
+        with patch("server.TRANSCRIPTS_DIR", _transcripts), \
+             patch("server.PID_FILE", _tmpdir / "nonexistent.pid"), \
+             patch("server.INSTALL_DIR", _tmpdir):
+            result = _run(server.call_tool("get_status", {}))
+        text = result[0].text
+        assert "Watcher:" in text
+        assert "Recording:" in text
+        assert "Transcripts:" in text
+
+    def test_shows_transcript_count(self):
+        for i in range(5):
+            (_transcripts / f"meeting_{i}.txt").write_text(f"content {i}")
+        with patch("server.TRANSCRIPTS_DIR", _transcripts), \
+             patch("server.PID_FILE", _tmpdir / "nonexistent.pid"), \
+             patch("server.INSTALL_DIR", _tmpdir):
+            result = _run(server.call_tool("get_status", {}))
+        assert "5 meetings" in result[0].text

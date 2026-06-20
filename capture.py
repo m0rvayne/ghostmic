@@ -186,12 +186,29 @@ def format_time(dt: datetime) -> str:
     return dt.strftime("%H:%M:%S")
 
 
+_detected_language = None
+
+
 def transcribe_chunk(model, audio_np: np.ndarray) -> str:
-    segments, _ = model.transcribe(
-        audio_np, language=None, beam_size=5,
-        vad_filter=True, vad_parameters={"min_silence_duration_ms": 500},
+    global _detected_language
+    segments, info = model.transcribe(
+        audio_np,
+        language=_detected_language,  # None on first chunk → auto-detect, then locked
+        beam_size=5,
+        vad_filter=True,
+        vad_parameters={"min_silence_duration_ms": 500},
     )
-    return " ".join(seg.text.strip() for seg in segments).strip()
+    text_parts = []
+    for seg in segments:
+        text_parts.append(seg.text.strip())
+    text = " ".join(text_parts).strip()
+
+    # Lock language after first successful detection
+    if _detected_language is None and text and info.language:
+        _detected_language = info.language
+        print(f"[meeting] Language detected: {info.language} (probability: {info.language_probability:.2f})", flush=True)
+
+    return text
 
 
 def _drain_queue(q: queue.Queue) -> list:

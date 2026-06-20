@@ -3,6 +3,7 @@ MCP server: live meeting transcript + conference map generator.
 """
 import os
 import re
+import shutil
 import subprocess
 import time
 from pathlib import Path
@@ -11,13 +12,16 @@ from mcp.server import Server
 from mcp.server.stdio import stdio_server
 from mcp import types
 
-CURRENT = Path(__file__).parent / "transcripts" / "meeting_transcript.txt"
-TRANSCRIPTS_DIR = Path(__file__).parent / "transcripts"
+INSTALL_DIR = Path(__file__).parent
+CURRENT = INSTALL_DIR / "transcripts" / "meeting_transcript.txt"
+TRANSCRIPTS_DIR = INSTALL_DIR / "transcripts"
 MINDNODE_TMP = Path("/tmp/mindnode-mcp")
+PID_FILE = INSTALL_DIR / "watcher.pid"
 FRESHNESS_THRESHOLD = 180  # seconds
-MAX_TRANSCRIPT_BYTES = 50 * 1024 * 1024  # 50 MB — refuse to read larger files
+MAX_TRANSCRIPT_BYTES = 50 * 1024 * 1024  # 50 MB
 MAX_OUTLINE_BYTES = 1024 * 1024  # 1 MB
 MAX_PAST_MEETINGS = 200
+MAX_SEARCH_RESULTS = 20
 
 server = Server("meeting-transcript")
 
@@ -255,6 +259,30 @@ async def list_tools():
                 },
             },
         ),
+        types.Tool(
+            name="search_transcripts",
+            description=(
+                "Search across all past meeting transcripts for a keyword or phrase. "
+                "Returns matching excerpts with filenames. Use when asked: "
+                "'when did we discuss X', 'find the meeting about Y'."
+            ),
+            inputSchema={
+                "type": "object",
+                "required": ["query"],
+                "properties": {
+                    "query": {"type": "string", "description": "Search term or phrase"},
+                },
+            },
+        ),
+        types.Tool(
+            name="get_status",
+            description=(
+                "Get the current status of the meeting transcript system. "
+                "Shows whether the watcher daemon is running, if a recording is active, "
+                "disk space, and transcript count."
+            ),
+            inputSchema={"type": "object", "properties": {}},
+        ),
     ]
 
 
@@ -316,6 +344,87 @@ async def call_tool(name: str, arguments: dict | None):
         if path.stat().st_size > MAX_TRANSCRIPT_BYTES:
             return [types.TextContent(type="text", text="Transcript too large to read.")]
         return [types.TextContent(type="text", text=path.read_text(encoding="utf-8"))]
+
+    elif name == "search_transcripts":
+        query = arguments.get("query", "").strip()
+        if not query:
+            return [types.TextContent(type="text", text="Empty search query.")]
+        if not TRANSCRIPTS_DIR.exists():
+            return [types.TextContent(type="text", text="No transcripts to search.")]
+
+        results = []
+        files = sorted(TRANSCRIPTS_DIR.glob("*.txt"), reverse=True)
+        files = [f for f in files if f.name != "meeting_transcript.txt" and not f.is_symlink()]
+
+        for f in files[:MAX_PAST_MEETINGS]:
+            if f.stat().st_size > MAX_TRANSCRIPT_BYTES:
+                continue
+            try:
+                content = f.read_text(encoding="utf-8")
+            except Exception:
+                continue
+            if query.lower() not in content.lower():
+                continue
+
+            # Extract matching lines with context
+            lines = content.split("\n")
+            matches = []
+            for i, line in enumerate(lines):
+                if query.lower() in line.lower():
+                    matches.append(line.strip())
+                    if len(matches) >= 3:
+                        break
+
+            results.append(f"**{f.name}**\n" + "\n".join(f"  {m}" for m in matches))
+            if len(results) >= MAX_SEARCH_RESULTS:
+                break
+
+        if not results:
+            return [types.TextContent(type="text", text=f"No matches found for '{query}'.")]
+        header = f"Found '{query}' in {len(results)} meeting(s):\n\n"
+        return [types.TextContent(type="text", text=header + "\n\n".join(results))]
+
+    elif name == "get_status":
+        status_parts = []
+
+        # Watcher status
+        watcher_running = False
+        if PID_FILE.exists():
+            try:
+                pid = int(PID_FILE.read_text().strip())
+                os.kill(pid, 0)  # check if alive
+                watcher_running = True
+                status_parts.append(f"Watcher: running (PID {pid})")
+            except (ValueError, ProcessLookupError, PermissionError):
+                status_parts.append("Watcher: not running")
+        else:
+            status_parts.append("Watcher: not running (no PID file)")
+
+        # Recording status
+        if _is_recording_live():
+            target = _resolve_transcript()
+            status_parts.append(f"Recording: ACTIVE ({target.name if target else 'unknown'})")
+        else:
+            status_parts.append("Recording: inactive")
+
+        # Transcript stats
+        if TRANSCRIPTS_DIR.exists():
+            txt_files = [f for f in TRANSCRIPTS_DIR.glob("*.txt")
+                         if f.name != "meeting_transcript.txt" and not f.is_symlink()]
+            total_size = sum(f.stat().st_size for f in txt_files)
+            status_parts.append(f"Transcripts: {len(txt_files)} meetings ({total_size // 1024 // 1024} MB)")
+        else:
+            status_parts.append("Transcripts: none")
+
+        # Disk space
+        try:
+            usage = shutil.disk_usage(TRANSCRIPTS_DIR.parent)
+            free_gb = usage.free / (1024 ** 3)
+            status_parts.append(f"Disk free: {free_gb:.1f} GB")
+        except Exception:
+            pass
+
+        return [types.TextContent(type="text", text="\n".join(status_parts))]
 
     return [types.TextContent(type="text", text=f"Unknown tool: {name}")]
 
