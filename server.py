@@ -1,6 +1,7 @@
 """
 MCP server: live meeting transcript + conference map generator.
 """
+import os
 import re
 import subprocess
 import time
@@ -13,22 +14,29 @@ from mcp import types
 CURRENT = Path(__file__).parent / "transcripts" / "meeting_transcript.txt"
 TRANSCRIPTS_DIR = Path(__file__).parent / "transcripts"
 MINDNODE_TMP = Path("/tmp/mindnode-mcp")
-FRESHNESS_THRESHOLD = 180  # seconds — if file not updated in 3 min, it's stale
+FRESHNESS_THRESHOLD = 180  # seconds
+MAX_TRANSCRIPT_BYTES = 50 * 1024 * 1024  # 50 MB — refuse to read larger files
+MAX_OUTLINE_BYTES = 1024 * 1024  # 1 MB
+MAX_PAST_MEETINGS = 200
 
 server = Server("meeting-transcript")
 
 
 def _resolve_transcript() -> Path | None:
-    """Resolve the current transcript symlink to its target file."""
+    """Resolve the current transcript symlink, with boundary check."""
     try:
         target = CURRENT.resolve() if CURRENT.is_symlink() else CURRENT
-        return target if target.exists() else None
+        if not target.exists():
+            return None
+        # Boundary check — symlink must point within transcripts dir
+        if not target.is_relative_to(TRANSCRIPTS_DIR.resolve()):
+            return None
+        return target
     except Exception:
         return None
 
 
 def _is_recording_live() -> bool:
-    """Check if the transcript file is being actively written (updated within threshold)."""
     target = _resolve_transcript()
     if not target:
         return False
@@ -37,7 +45,6 @@ def _is_recording_live() -> bool:
 
 
 def _freshness_note() -> str:
-    """Return a warning prefix if the transcript is stale (not from an active recording)."""
     if _is_recording_live():
         return ""
     target = _resolve_transcript()
@@ -52,10 +59,15 @@ def _freshness_note() -> str:
 
 
 def _safe_transcript_path(filename: str) -> Path | None:
-    """Resolve filename and ensure it stays within TRANSCRIPTS_DIR."""
+    """Resolve filename and ensure it stays within TRANSCRIPTS_DIR. Rejects symlinks."""
     if not filename or "/" in filename or "\\" in filename or ".." in filename:
         return None
-    path = (TRANSCRIPTS_DIR / filename).resolve()
+    if "%" in filename:  # reject URL-encoded paths
+        return None
+    candidate = TRANSCRIPTS_DIR / filename
+    if candidate.is_symlink():  # reject symlinks as defense-in-depth
+        return None
+    path = candidate.resolve()
     if not path.is_relative_to(TRANSCRIPTS_DIR.resolve()):
         return None
     if not path.exists():
@@ -64,22 +76,26 @@ def _safe_transcript_path(filename: str) -> Path | None:
 
 
 def read_transcript_text() -> str:
-    if not CURRENT.exists():
+    target = _resolve_transcript()
+    if not target:
         return ""
-    return CURRENT.read_text(encoding="utf-8").strip()
+    if target.stat().st_size > MAX_TRANSCRIPT_BYTES:
+        return "[Transcript too large to read in full]"
+    return target.read_text(encoding="utf-8").strip()
 
 
 def _filter_by_minutes(text: str, last_minutes: float) -> str:
     """Filter transcript lines to only include the last N minutes based on timestamps."""
+    if not (last_minutes and last_minutes > 0 and last_minutes == last_minutes):  # handles NaN
+        return text
+
     lines = [l for l in text.split("\n") if l.strip()]
     if not lines:
         return text
 
-    # Parse timestamps from lines like [HH:MM:SS-HH:MM:SS] ...
     ts_pattern = re.compile(r"^\[(\d{2}:\d{2}:\d{2})")
     cutoff = None
 
-    # Find the latest timestamp to calculate cutoff
     for line in reversed(lines):
         m = ts_pattern.match(line)
         if m:
@@ -89,11 +105,9 @@ def _filter_by_minutes(text: str, last_minutes: float) -> str:
             break
 
     if cutoff is None:
-        # No timestamps found, fall back to returning last N lines
         keep = max(1, int(last_minutes * 2))
         return "\n".join(lines[-keep:])
 
-    # Filter lines that start after cutoff
     result = []
     for line in lines:
         m = ts_pattern.match(line)
@@ -103,7 +117,6 @@ def _filter_by_minutes(text: str, last_minutes: float) -> str:
             if secs >= cutoff:
                 result.append(line)
         else:
-            # Non-timestamped lines (headers, etc.) — include if we're already collecting
             if result:
                 result.append(line)
 
@@ -111,20 +124,31 @@ def _filter_by_minutes(text: str, last_minutes: float) -> str:
 
 
 def open_in_mindnode(outline: str, title: str) -> str:
+    if len(outline.encode("utf-8")) > MAX_OUTLINE_BYTES:
+        raise ValueError("Outline too large (max 1 MB)")
+
     MINDNODE_TMP.mkdir(parents=True, exist_ok=True)
-    safe_title = re.sub(r'[^a-zA-Za-яА-ЯёЁ0-9_ -]', '_', title)[:100]
+    # Clean up old files
+    for old in MINDNODE_TMP.glob("*.md"):
+        try:
+            if time.time() - old.stat().st_mtime > 3600:
+                old.unlink()
+        except Exception:
+            pass
+
+    safe_title = re.sub(r'[^a-zA-Zа-яА-ЯёЁ0-9_ -]', '_', title)[:100]
     filepath = MINDNODE_TMP / f"{safe_title}.md"
     filepath.write_text(outline, encoding="utf-8")
     subprocess.run(["open", "-a", "MindNode", str(filepath)], timeout=10)
     return str(filepath)
 
 
-# ── Resources ────────────────────────────────────────────────────────────────
+# -- Resources ----------------------------------------------------------------
 
 @server.list_resources()
 async def list_resources():
     resources = []
-    if CURRENT.exists():
+    if _resolve_transcript():
         resources.append(types.Resource(
             uri="meeting://current/transcript",
             name="Current meeting transcript",
@@ -132,14 +156,18 @@ async def list_resources():
             mimeType="text/plain",
         ))
     if TRANSCRIPTS_DIR.exists():
+        count = 0
         for f in sorted(TRANSCRIPTS_DIR.glob("*.txt"), reverse=True):
-            if f.name == "meeting_transcript.txt":
+            if f.name == "meeting_transcript.txt" or f.is_symlink():
                 continue
             resources.append(types.Resource(
                 uri=f"meeting://past/{f.name}",
                 name=f"Meeting {f.stem}",
                 mimeType="text/plain",
             ))
+            count += 1
+            if count >= MAX_PAST_MEETINGS:
+                break
     return resources
 
 
@@ -157,12 +185,14 @@ async def read_resource(uri):
         path = _safe_transcript_path(filename)
         if not path:
             return "File not found."
+        if path.stat().st_size > MAX_TRANSCRIPT_BYTES:
+            return "Transcript too large."
         return path.read_text(encoding="utf-8")
 
     return "Unknown resource."
 
 
-# ── Tools ────────────────────────────────────────────────────────────────────
+# -- Tools --------------------------------------------------------------------
 
 @server.list_tools()
 async def list_tools():
@@ -183,14 +213,8 @@ async def list_tools():
                 "type": "object",
                 "required": ["outline", "title"],
                 "properties": {
-                    "title": {
-                        "type": "string",
-                        "description": "Mind map title",
-                    },
-                    "outline": {
-                        "type": "string",
-                        "description": "Full Markdown outline with adaptive heading depth (# through ######)",
-                    },
+                    "title": {"type": "string", "description": "Mind map title"},
+                    "outline": {"type": "string", "description": "Full Markdown outline with adaptive heading depth"},
                 },
             },
         ),
@@ -226,7 +250,7 @@ async def list_tools():
                 "properties": {
                     "filename": {
                         "type": "string",
-                        "description": "Transcript filename (e.g. '2026-06-20_14-30.txt')",
+                        "description": "Transcript filename (e.g. '2026-06-20_14-30-00.txt')",
                     },
                 },
             },
@@ -235,7 +259,9 @@ async def list_tools():
 
 
 @server.call_tool()
-async def call_tool(name: str, arguments: dict):
+async def call_tool(name: str, arguments: dict | None):
+    arguments = arguments or {}
+
     if name == "create_conference_map":
         outline = arguments.get("outline", "")
         title = arguments.get("title", f"Meeting {datetime.now().strftime('%d.%m.%Y')}")
@@ -251,10 +277,10 @@ async def call_tool(name: str, arguments: dict):
             ))]
 
         try:
-            filepath = open_in_mindnode(outline, title)
+            open_in_mindnode(outline, title)
             return [types.TextContent(type="text", text=f"Map '{title}' opened in MindNode.")]
-        except Exception as e:
-            return [types.TextContent(type="text", text=f"Error opening MindNode: {e}")]
+        except Exception:
+            return [types.TextContent(type="text", text="Failed to open in MindNode. Is MindNode installed?")]
 
     elif name == "read_meeting_transcript":
         text = read_transcript_text()
@@ -262,8 +288,11 @@ async def call_tool(name: str, arguments: dict):
             return [types.TextContent(type="text", text="Transcript is empty.")]
 
         last_minutes = arguments.get("last_minutes")
-        if last_minutes:
-            text = _filter_by_minutes(text, float(last_minutes))
+        if last_minutes is not None:
+            try:
+                text = _filter_by_minutes(text, float(last_minutes))
+            except (ValueError, TypeError):
+                pass  # ignore invalid values, return full transcript
 
         note = _freshness_note()
         return [types.TextContent(type="text", text=note + text)]
@@ -272,9 +301,10 @@ async def call_tool(name: str, arguments: dict):
         if not TRANSCRIPTS_DIR.exists():
             return [types.TextContent(type="text", text="No recorded meetings.")]
         files = sorted(TRANSCRIPTS_DIR.glob("*.txt"), reverse=True)
-        files = [f for f in files if f.name != "meeting_transcript.txt"]
+        files = [f for f in files if f.name != "meeting_transcript.txt" and not f.is_symlink()]
         if not files:
             return [types.TextContent(type="text", text="No recorded meetings.")]
+        files = files[:MAX_PAST_MEETINGS]
         lines = [f"- {f.name}  ({f.stat().st_size // 1024} KB)" for f in files]
         return [types.TextContent(type="text", text="\n".join(lines))]
 
@@ -283,6 +313,8 @@ async def call_tool(name: str, arguments: dict):
         path = _safe_transcript_path(filename)
         if not path:
             return [types.TextContent(type="text", text="File not found or invalid filename.")]
+        if path.stat().st_size > MAX_TRANSCRIPT_BYTES:
+            return [types.TextContent(type="text", text="Transcript too large to read.")]
         return [types.TextContent(type="text", text=path.read_text(encoding="utf-8"))]
 
     return [types.TextContent(type="text", text=f"Unknown tool: {name}")]
