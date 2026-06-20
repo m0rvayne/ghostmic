@@ -290,3 +290,41 @@ class TestGetStatus:
              patch("server.INSTALL_DIR", _tmpdir):
             result = _run(server.call_tool("get_status", {}))
         assert "5 meetings" in result[0].text
+
+
+class TestMeetingNotesPrompt:
+    def test_list_prompts(self):
+        prompts = _run(server.list_prompts())
+        assert len(prompts) == 1
+        assert prompts[0].name == "meeting-notes"
+
+    def test_get_prompt_with_current_transcript(self, sample_transcript):
+        with patch("server.CURRENT", _transcripts / "meeting_transcript.txt"), \
+             patch("server.TRANSCRIPTS_DIR", _transcripts):
+            result = _run(server.get_prompt("meeting-notes", {}))
+        assert len(result.messages) == 1
+        text = result.messages[0].content.text
+        assert "Topics Discussed" in text
+        assert "Action Items" in text
+        assert "Hello everyone" in text
+
+    def test_get_prompt_with_past_meeting(self, sample_transcript):
+        with patch("server.TRANSCRIPTS_DIR", _transcripts):
+            result = _run(server.get_prompt("meeting-notes", {"filename": "2026-06-20_14-30-00.txt"}))
+        text = result.messages[0].content.text
+        assert "roadmap" in text
+
+    def test_get_prompt_no_transcript(self):
+        with patch("server.CURRENT", _transcripts / "meeting_transcript.txt"), \
+             patch("server.TRANSCRIPTS_DIR", _transcripts):
+            with pytest.raises(ValueError, match="No transcript"):
+                _run(server.get_prompt("meeting-notes", {}))
+
+    def test_get_prompt_unknown_name(self):
+        with pytest.raises(ValueError, match="Unknown prompt"):
+            _run(server.get_prompt("nonexistent", {}))
+
+    def test_get_prompt_invalid_filename(self):
+        with patch("server.TRANSCRIPTS_DIR", _transcripts):
+            with pytest.raises(ValueError, match="not found"):
+                _run(server.get_prompt("meeting-notes", {"filename": "../../etc/passwd"}))

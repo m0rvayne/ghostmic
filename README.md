@@ -66,8 +66,9 @@ tail -20 ~/.meeting-transcript-mcp/watcher.log
 
 **In Claude** (restart Desktop with Cmd+Q first):
 
-- "what are they talking about?" — live transcript of the current meeting
+- "what are they talking about?" — live transcript with speaker labels ([You] / [Remote])
 - "summarize the last 10 minutes" — filtered view
+- "make meeting notes" — structured notes with topics, decisions, action items (via meeting-notes prompt)
 - "list past meetings" — all recorded sessions
 - "search meetings for 'budget'" — find specific discussions
 - "get status" — check if recording is active
@@ -102,6 +103,7 @@ bash ~/.meeting-transcript-mcp/setup-audio.sh
 |----------|---------|-------------|
 | `WHISPER_MODEL` | `small` | Model size: `tiny`, `base`, `small`, `medium`, `large-v3` |
 | `PASSTHROUGH` | `0` | Set to `1` for software audio passthrough (without Multi-Output Device) |
+| `DIARIZATION` | `1` | Speaker labels: `[You]` vs `[Remote]` based on mic/system audio channels |
 
 ## Troubleshooting
 

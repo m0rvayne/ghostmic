@@ -161,7 +161,7 @@ def start_capture():
 
     env = os.environ.copy()
     env["TRANSCRIPT_FILE"] = str(current_transcript_path)
-    for k in ("PASSTHROUGH", "WHISPER_MODEL"):
+    for k in ("PASSTHROUGH", "WHISPER_MODEL", "DIARIZATION"):
         if k in os.environ:
             env[k] = os.environ[k]
 

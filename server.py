@@ -179,6 +179,112 @@ async def read_resource(uri):
     return "Unknown resource."
 
 
+# -- Prompts ------------------------------------------------------------------
+
+MEETING_NOTES_TEMPLATE = """You are a professional meeting note-taker. Create structured meeting notes from the transcript below.
+
+RULES:
+- Only include information explicitly stated in the transcript
+- Do NOT invent, infer, or add anything not said
+- If something is unclear, write [unclear] rather than guessing
+- Attribute statements to speakers when labels ([You], [Remote]) are present
+- Generate notes in the same language as the majority of the transcript
+
+FORMAT:
+
+## Meeting Overview
+Date, duration, participants (if identifiable from context). 1-2 sentence summary of the meeting purpose.
+
+## Topics Discussed
+
+### [Topic 1 name]
+- Key points discussed
+- Who said what (when speaker labels are available)
+- Context and details
+
+### [Topic 2 name]
+...add as many topics as needed...
+
+## Decisions Made
+- Each decision with brief reasoning/context
+- If no decisions were made, write "No decisions were made."
+
+## Action Items
+| Task | Owner | Deadline |
+|------|-------|----------|
+| Specific task | Person (if mentioned) | Date (if mentioned) |
+
+If no action items, write "No action items were identified."
+
+## Open Questions
+- Unresolved items or questions that need follow-up
+- If none, omit this section
+
+## Key Takeaways
+- 3-5 bullet points capturing the most important outcomes
+
+---
+
+TRANSCRIPT:
+
+{transcript}"""
+
+
+@server.list_prompts()
+async def list_prompts():
+    return [
+        types.Prompt(
+            name="meeting-notes",
+            description=(
+                "Generate structured meeting notes from a transcript. "
+                "Organizes by topics, captures decisions, action items, and key takeaways. "
+                "Uses only information from the transcript — no hallucination."
+            ),
+            arguments=[
+                types.PromptArgument(
+                    name="filename",
+                    description="Transcript filename for a past meeting (optional — defaults to current)",
+                    required=False,
+                ),
+            ],
+        ),
+    ]
+
+
+@server.get_prompt()
+async def get_prompt(name: str, arguments: dict | None):
+    if name != "meeting-notes":
+        raise ValueError(f"Unknown prompt: {name}")
+
+    arguments = arguments or {}
+    filename = arguments.get("filename")
+
+    if filename:
+        path = _safe_transcript_path(filename)
+        if not path:
+            raise ValueError(f"Transcript not found: {filename}")
+        transcript = path.read_text(encoding="utf-8", errors="replace")
+    else:
+        transcript = read_transcript_text()
+        if not transcript:
+            raise ValueError("No transcript available. Start a meeting recording first.")
+
+    note = _freshness_note()
+
+    return types.GetPromptResult(
+        description="Structured meeting notes from transcript",
+        messages=[
+            types.PromptMessage(
+                role="user",
+                content=types.TextContent(
+                    type="text",
+                    text=note + MEETING_NOTES_TEMPLATE.format(transcript=transcript),
+                ),
+            ),
+        ],
+    )
+
+
 # -- Tools --------------------------------------------------------------------
 
 @server.list_tools()
@@ -264,7 +370,10 @@ async def call_tool(name: str, arguments: dict | None):
                 pass
 
         note = _freshness_note()
-        return [types.TextContent(type="text", text=note + text)]
+        result = note + text
+        if not _is_recording_live():
+            result += "\n\n---\nTIP: For structured meeting notes with topics, decisions, and action items, use the meeting-notes prompt."
+        return [types.TextContent(type="text", text=result)]
 
     elif name == "list_past_meetings":
         if not TRANSCRIPTS_DIR.exists():

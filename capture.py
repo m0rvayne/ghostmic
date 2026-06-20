@@ -27,6 +27,7 @@ _DEFAULT_TRANSCRIPT = Path(__file__).parent / "transcripts" / "meeting_transcrip
 TRANSCRIPT_FILE = Path(os.environ.get("TRANSCRIPT_FILE", _DEFAULT_TRANSCRIPT))
 MODEL_SIZE = os.environ.get("WHISPER_MODEL", "small")
 ENABLE_PASSTHROUGH = os.environ.get("PASSTHROUGH", "0") == "1"
+ENABLE_DIARIZATION = os.environ.get("DIARIZATION", "1") == "1"
 PASSTHROUGH_RATE = 48000
 
 # Bounded queues to prevent OOM
@@ -234,6 +235,72 @@ def _write_transcript(path: Path, line: str):
         raise
 
 
+def _classify_speakers(audio_bh: np.ndarray, audio_mic: np.ndarray,
+                       frame_ms: int = 500) -> list[tuple[str, int, int]]:
+    """Classify [You] vs [Remote] using energy ratio between the two channels.
+
+    BlackHole has ONLY remote audio (virtual device, no bleed).
+    Microphone has local speaker + some room bleed of remote audio.
+    When local speaker talks, mic energy >> bh energy.
+    When remote speaks, bh energy is high and mic picks up attenuated bleed.
+    """
+    frame_size = int(SAMPLE_RATE * frame_ms / 1000)
+    segments = []
+    silence_threshold = 0.005
+
+    for i in range(0, min(len(audio_bh), len(audio_mic)), frame_size):
+        bh_frame = audio_bh[i:i + frame_size]
+        mic_frame = audio_mic[i:i + frame_size]
+
+        energy_bh = np.sqrt(np.mean(bh_frame ** 2))
+        energy_mic = np.sqrt(np.mean(mic_frame ** 2))
+
+        if energy_bh < silence_threshold and energy_mic < silence_threshold:
+            continue
+
+        ratio = energy_mic / (energy_bh + 1e-8)
+        speaker = "[You]" if ratio > 2.5 else "[Remote]"
+        segments.append((speaker, i, i + frame_size))
+
+    # Merge consecutive same-speaker segments
+    if not segments:
+        return []
+    merged = [segments[0]]
+    for speaker, start, end in segments[1:]:
+        if speaker == merged[-1][0]:
+            merged[-1] = (speaker, merged[-1][1], end)
+        else:
+            merged.append((speaker, start, end))
+    return merged
+
+
+def _build_diarized_text(text: str, segments: list[tuple[str, int, int]],
+                         audio_len: int) -> str:
+    """Prepend dominant speaker label to transcribed text."""
+    if not segments:
+        return text
+
+    # Find the speaker who talked most in this chunk
+    speaker_time = {}
+    for speaker, start, end in segments:
+        speaker_time[speaker] = speaker_time.get(speaker, 0) + (end - start)
+
+    dominant = max(speaker_time, key=speaker_time.get)
+
+    # If both speakers talked, show transitions
+    if len(speaker_time) > 1:
+        total = sum(speaker_time.values())
+        you_pct = speaker_time.get("[You]", 0) / total
+        if you_pct > 0.7:
+            return f"[You] {text}"
+        elif you_pct < 0.3:
+            return f"[Remote] {text}"
+        else:
+            return f"[You + Remote] {text}"
+
+    return f"{dominant} {text}"
+
+
 def _touch_heartbeat(path: Path):
     """Touch file mtime so server.py knows we're alive even during silence."""
     try:
@@ -268,13 +335,14 @@ def writer_thread(model, has_mic: bool):
 
             if total_bh >= SAMPLE_RATE * CHUNK_SECONDS:
                 audio_bh = np.concatenate(buffer_bh).flatten().astype(np.float32)
+                audio_mic_raw = None
 
                 if has_mic and buffer_mic:
-                    audio_mic = np.concatenate(buffer_mic).flatten().astype(np.float32)
-                    max_len = max(len(audio_bh), len(audio_mic))
-                    audio_bh = np.pad(audio_bh, (0, max(0, max_len - len(audio_bh))))
-                    audio_mic = np.pad(audio_mic, (0, max(0, max_len - len(audio_mic))))
-                    audio_mixed = np.clip((audio_bh + audio_mic) * 0.5, -1.0, 1.0)
+                    audio_mic_raw = np.concatenate(buffer_mic).flatten().astype(np.float32)
+                    max_len = max(len(audio_bh), len(audio_mic_raw))
+                    audio_bh_padded = np.pad(audio_bh, (0, max(0, max_len - len(audio_bh))))
+                    audio_mic_padded = np.pad(audio_mic_raw, (0, max(0, max_len - len(audio_mic_raw))))
+                    audio_mixed = np.clip((audio_bh_padded + audio_mic_padded) * 0.5, -1.0, 1.0)
                 else:
                     audio_mixed = audio_bh
 
@@ -286,6 +354,13 @@ def writer_thread(model, has_mic: bool):
                 text = transcribe_chunk(model, audio_mixed)
 
                 if text:
+                    # Speaker diarization: label [You] vs [Remote] using pre-mix channels
+                    if ENABLE_DIARIZATION and audio_mic_raw is not None:
+                        try:
+                            segments = _classify_speakers(audio_bh, audio_mic_raw)
+                            text = _build_diarized_text(text, segments, len(audio_bh))
+                        except Exception:
+                            pass  # fall back to unlabeled text
                     line = f"[{format_time(chunk_start)}-{format_time(chunk_end)}] {text}\n"
                     _write_transcript(TRANSCRIPT_FILE, line)
                     print(f"[meeting] -> {text[:80]}...", flush=True)

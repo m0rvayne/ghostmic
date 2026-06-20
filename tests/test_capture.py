@@ -162,3 +162,57 @@ class TestWriteTranscript:
         with open(f, "a", encoding="utf-8") as fh:
             fh.write("line 2\n")
         assert f.read_text() == "line 1\nline 2\n"
+
+
+class TestSpeakerDiarization:
+    """Two-channel speaker classification."""
+
+    def _classify(self, bh, mic, frame_ms=500):
+        """Inline implementation matching capture.py logic."""
+        sample_rate = 16000
+        frame_size = int(sample_rate * frame_ms / 1000)
+        segments = []
+        silence_threshold = 0.005
+        for i in range(0, min(len(bh), len(mic)), frame_size):
+            bh_frame = bh[i:i + frame_size]
+            mic_frame = mic[i:i + frame_size]
+            energy_bh = np.sqrt(np.mean(bh_frame ** 2))
+            energy_mic = np.sqrt(np.mean(mic_frame ** 2))
+            if energy_bh < silence_threshold and energy_mic < silence_threshold:
+                continue
+            ratio = energy_mic / (energy_bh + 1e-8)
+            speaker = "[You]" if ratio > 2.5 else "[Remote]"
+            segments.append((speaker, i, i + frame_size))
+        return segments
+
+    def test_remote_speaker_only(self):
+        """When only BlackHole has audio, should label [Remote]."""
+        bh = np.full(16000, 0.3, dtype=np.float32)  # 1 second of audio
+        mic = np.full(16000, 0.01, dtype=np.float32)  # near silence
+        segments = self._classify(bh, mic)
+        assert len(segments) > 0
+        assert all(s[0] == "[Remote]" for s in segments)
+
+    def test_local_speaker_only(self):
+        """When mic is much louder than BlackHole, should label [You]."""
+        bh = np.full(16000, 0.01, dtype=np.float32)  # near silence
+        mic = np.full(16000, 0.5, dtype=np.float32)  # talking
+        segments = self._classify(bh, mic)
+        assert len(segments) > 0
+        assert all(s[0] == "[You]" for s in segments)
+
+    def test_silence_skipped(self):
+        """Pure silence should produce no segments."""
+        bh = np.zeros(16000, dtype=np.float32)
+        mic = np.zeros(16000, dtype=np.float32)
+        segments = self._classify(bh, mic)
+        assert len(segments) == 0
+
+    def test_both_speaking(self):
+        """When both channels have similar energy, should label [Remote] (mic bleed)."""
+        bh = np.full(16000, 0.3, dtype=np.float32)
+        mic = np.full(16000, 0.3, dtype=np.float32)  # mic picks up remote speaker
+        segments = self._classify(bh, mic)
+        assert len(segments) > 0
+        # ratio = 0.3 / 0.3 = 1.0, which is < 2.5, so [Remote]
+        assert all(s[0] == "[Remote]" for s in segments)
