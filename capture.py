@@ -10,6 +10,7 @@ import sys
 import os
 import queue
 import signal
+import time
 import threading
 from datetime import datetime
 from pathlib import Path
@@ -256,8 +257,7 @@ def writer_thread(model, has_mic: bool):
                     max_len = max(len(audio_bh), len(audio_mic))
                     audio_bh = np.pad(audio_bh, (0, max(0, max_len - len(audio_bh))))
                     audio_mic = np.pad(audio_mic, (0, max(0, max_len - len(audio_mic))))
-                    # Clip instead of averaging to preserve signal level
-                    audio_mixed = np.clip(audio_bh + audio_mic, -1.0, 1.0)
+                    audio_mixed = np.clip((audio_bh + audio_mic) * 0.5, -1.0, 1.0)
                 else:
                     audio_mixed = audio_bh
 
@@ -293,7 +293,7 @@ def writer_thread(model, has_mic: bool):
                 max_len = max(len(audio), len(mic_audio))
                 audio = np.pad(audio, (0, max(0, max_len - len(audio))))
                 mic_audio = np.pad(mic_audio, (0, max(0, max_len - len(mic_audio))))
-                audio = np.clip(audio + mic_audio, -1.0, 1.0)
+                audio = np.clip((audio + mic_audio) * 0.5, -1.0, 1.0)
             text = transcribe_chunk(model, audio)
             if text:
                 _write_transcript(TRANSCRIPT_FILE,

@@ -64,27 +64,33 @@ class TestResampleLinear:
 
 
 class TestAudioMixing:
-    """Mixing behavior: clip vs average."""
+    """Mixing behavior: average with clip safety."""
 
-    def test_clip_instead_of_average(self):
-        """Mixing should clip, not halve the signal."""
-        a = np.full(100, 0.5, dtype=np.float32)
-        b = np.full(100, 0.3, dtype=np.float32)
-        mixed = np.clip(a + b, -1.0, 1.0)
-        # Should be 0.8, not 0.4
-        np.testing.assert_allclose(mixed, 0.8, atol=1e-6)
+    def test_average_preserves_level(self):
+        """Two equal signals should average to half."""
+        a = np.full(100, 0.6, dtype=np.float32)
+        b = np.full(100, 0.4, dtype=np.float32)
+        mixed = np.clip((a + b) * 0.5, -1.0, 1.0)
+        np.testing.assert_allclose(mixed, 0.5, atol=1e-6)
+
+    def test_single_source_not_attenuated_excessively(self):
+        """One loud + one silent should give half the loud signal."""
+        a = np.full(100, 0.8, dtype=np.float32)
+        b = np.zeros(100, dtype=np.float32)
+        mixed = np.clip((a + b) * 0.5, -1.0, 1.0)
+        np.testing.assert_allclose(mixed, 0.4, atol=1e-6)
 
     def test_clipping_at_boundary(self):
-        """Loud signals should clip at 1.0, not overflow."""
-        a = np.full(100, 0.8, dtype=np.float32)
-        b = np.full(100, 0.9, dtype=np.float32)
-        mixed = np.clip(a + b, -1.0, 1.0)
-        np.testing.assert_allclose(mixed, 1.0, atol=1e-6)
+        """Extremely loud combined signals should clip at 1.0."""
+        a = np.full(100, 1.5, dtype=np.float32)
+        b = np.full(100, 1.5, dtype=np.float32)
+        mixed = np.clip((a + b) * 0.5, -1.0, 1.0)
+        np.testing.assert_allclose(mixed, 1.0, atol=1e-6)  # (1.5+1.5)*0.5 = 1.5 -> clip to 1.0
 
     def test_negative_clipping(self):
-        a = np.full(100, -0.8, dtype=np.float32)
-        b = np.full(100, -0.9, dtype=np.float32)
-        mixed = np.clip(a + b, -1.0, 1.0)
+        a = np.full(100, -1.5, dtype=np.float32)
+        b = np.full(100, -1.5, dtype=np.float32)
+        mixed = np.clip((a + b) * 0.5, -1.0, 1.0)
         np.testing.assert_allclose(mixed, -1.0, atol=1e-6)
 
 
