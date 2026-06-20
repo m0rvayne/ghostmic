@@ -124,6 +124,7 @@ def is_in_conference() -> bool:
 capture_process = None
 conference_end_time = None
 current_transcript_path = None
+running = True
 _crash_times: list[float] = []
 
 
@@ -222,7 +223,7 @@ def notify(title: str, message: str):
 # --------------------------------------------------------------------------
 
 def main():
-    global conference_end_time
+    global conference_end_time, running
 
     TRANSCRIPTS_DIR.mkdir(exist_ok=True)
     acquire_lock()
@@ -232,7 +233,7 @@ def main():
     running = True
 
     def handle_signal(sig, frame):
-        nonlocal running
+        global running
         running = False
 
     signal.signal(signal.SIGTERM, handle_signal)
