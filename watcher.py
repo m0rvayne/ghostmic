@@ -20,12 +20,11 @@ from pathlib import Path
 TRANSCRIPTS_DIR = Path(__file__).parent / "transcripts"
 CURRENT_TRANSCRIPT_SYMLINK = TRANSCRIPTS_DIR / "meeting_transcript.txt"
 CAPTURE_SCRIPT = Path(__file__).parent / "capture.py"
-PYTHON = Path(__file__).parent / ".venv/bin/python3.12"
-POLL_INTERVAL = 5   # seconds — check more often for snappier response
-
-# How long (seconds) to wait after Zoom signals meeting end before stopping.
-# Zoom kills CptHost and closes port 19421 promptly, so 15s is enough.
-GRACE_PERIOD = 15
+PYTHON = Path(__file__).parent / ".venv/bin/python3"
+POLL_INTERVAL = 5   # seconds
+GRACE_PERIOD = 15   # seconds after Zoom signals meeting end before stopping
+LOG_MAX_BYTES = 5 * 1024 * 1024  # 5 MB — truncate log when exceeded
+LOG_FILE = Path(__file__).parent / "watcher.log"
 
 TRANSCRIPTS_DIR.mkdir(exist_ok=True)
 
@@ -35,9 +34,43 @@ current_transcript_path = None
 running = True
 
 
-# ──────────────────────────────────────────────────────────────────────────────
+# --------------------------------------------------------------------------
+# Preflight checks
+# --------------------------------------------------------------------------
+
+def preflight():
+    """Verify required files exist before entering the main loop."""
+    errors = []
+    if not CAPTURE_SCRIPT.exists():
+        errors.append(f"capture.py not found: {CAPTURE_SCRIPT}")
+    if not PYTHON.exists():
+        errors.append(f"Python venv not found: {PYTHON}")
+    if errors:
+        for e in errors:
+            log(f"FATAL: {e}")
+        sys.exit(1)
+
+
+# --------------------------------------------------------------------------
+# Log rotation
+# --------------------------------------------------------------------------
+
+def rotate_log_if_needed():
+    """Truncate log file if it exceeds LOG_MAX_BYTES."""
+    try:
+        if LOG_FILE.exists() and LOG_FILE.stat().st_size > LOG_MAX_BYTES:
+            lines = LOG_FILE.read_text(encoding="utf-8", errors="replace").splitlines()
+            # Keep last 500 lines
+            keep = lines[-500:] if len(lines) > 500 else lines
+            LOG_FILE.write_text("\n".join(keep) + "\n", encoding="utf-8")
+            log("Log rotated (exceeded 5 MB)")
+    except Exception:
+        pass
+
+
+# --------------------------------------------------------------------------
 # Zoom Detection
-# ──────────────────────────────────────────────────────────────────────────────
+# --------------------------------------------------------------------------
 
 def zoom_cpthost_running() -> bool:
     """CptHost is Zoom's in-meeting subprocess — absent when not in a meeting."""
@@ -48,7 +81,6 @@ def zoom_cpthost_running() -> bool:
 def zoom_local_api_active() -> bool:
     """
     Zoom opens a local REST API on port 19421 only during active meetings.
-    This is a reliable secondary check.
     """
     try:
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -62,21 +94,16 @@ def zoom_local_api_active() -> bool:
 
 def is_in_conference() -> bool:
     """Return True if user is currently in a Zoom meeting."""
-    if zoom_cpthost_running():
-        return True
-    if zoom_local_api_active():
-        return True
-    return False
+    return zoom_cpthost_running() or zoom_local_api_active()
 
 
-# ──────────────────────────────────────────────────────────────────────────────
+# --------------------------------------------------------------------------
 # Capture lifecycle
-# ──────────────────────────────────────────────────────────────────────────────
+# --------------------------------------------------------------------------
 
 def start_capture():
     global capture_process, current_transcript_path
 
-    # Reuse existing transcript file if meeting is still the same (restart scenario)
     if current_transcript_path and current_transcript_path.exists() and current_transcript_path.stat().st_size > 0:
         log(f"Resuming transcript: {current_transcript_path.name}")
     else:
@@ -88,11 +115,10 @@ def start_capture():
         CURRENT_TRANSCRIPT_SYMLINK.unlink()
     CURRENT_TRANSCRIPT_SYMLINK.symlink_to(current_transcript_path)
 
-    notify("Запись встречи началась", f"Транскрипт: {current_transcript_path.name}")
+    notify("Meeting recording started", f"Transcript: {current_transcript_path.name}")
 
     env = os.environ.copy()
     env["TRANSCRIPT_FILE"] = str(current_transcript_path)
-    # Pass through config env vars
     for k in ("PASSTHROUGH", "WHISPER_MODEL"):
         if k in os.environ:
             env[k] = os.environ[k]
@@ -109,7 +135,7 @@ def start_capture():
             print(f"[capture] {line.decode().rstrip()}", flush=True)
 
     threading.Thread(target=stream_output, daemon=True).start()
-    log(f"Recording started → {current_transcript_path.name}")
+    log(f"Recording started -> {current_transcript_path.name}")
 
 
 def stop_capture():
@@ -124,7 +150,7 @@ def stop_capture():
 
     capture_process = None
     log(f"Recording stopped. Transcript: {current_transcript_path}")
-    notify("Запись встречи остановлена", f"Сохранено: {current_transcript_path.name}")
+    notify("Meeting recording stopped", f"Saved: {current_transcript_path.name}")
 
 
 def notify(title: str, message: str):
@@ -144,9 +170,9 @@ def log(msg: str):
     print(f"[watcher {ts}] {msg}", flush=True)
 
 
-# ──────────────────────────────────────────────────────────────────────────────
+# --------------------------------------------------------------------------
 # Main loop
-# ──────────────────────────────────────────────────────────────────────────────
+# --------------------------------------------------------------------------
 
 def handle_signal(sig, frame):
     global running
@@ -160,14 +186,16 @@ def handle_signal(sig, frame):
 signal.signal(signal.SIGTERM, handle_signal)
 signal.signal(signal.SIGINT, handle_signal)
 
+preflight()
 log("Watcher started. Monitoring for Zoom meetings...")
 
+poll_count = 0
 while running:
     in_conf = is_in_conference()
     is_recording = capture_process is not None and capture_process.poll() is None
 
     if in_conf:
-        conference_end_time = None  # reset grace timer
+        conference_end_time = None
         if not is_recording:
             log("Zoom meeting detected — starting capture")
             start_capture()
@@ -181,5 +209,10 @@ while running:
                 log("Grace period elapsed — stopping capture")
                 stop_capture()
                 conference_end_time = None
+
+    # Rotate log every ~100 polls (~8 min)
+    poll_count += 1
+    if poll_count % 100 == 0:
+        rotate_log_if_needed()
 
     time.sleep(POLL_INTERVAL)

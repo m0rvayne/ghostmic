@@ -3,8 +3,8 @@
 Meeting transcript capture with built-in audio passthrough.
 
 Architecture:
-  Zoom → BlackHole 2ch → capture.py → Whisper (transcription)
-                                     → Default output (speakers/headphones)
+  Zoom -> BlackHole 2ch -> capture.py -> Whisper (transcription)
+                                       -> Default output (speakers/headphones)
 
 No Multi-Output Device needed! Just set Zoom speaker to "BlackHole 2ch".
 When you plug/unplug headphones, audio follows automatically.
@@ -35,13 +35,13 @@ MODEL_SIZE = os.environ.get("WHISPER_MODEL", "small")
 ENABLE_PASSTHROUGH = os.environ.get("PASSTHROUGH", "0") == "1"
 PASSTHROUGH_RATE = 48000  # macOS native rate for output
 
-audio_queue = queue.Queue()      # BlackHole → transcription
-mic_queue = queue.Queue()        # Microphone → transcription
-passthrough_queue = queue.Queue() # BlackHole → speakers (so you can hear Zoom)
-running = True
+audio_queue = queue.Queue()      # BlackHole -> transcription
+mic_queue = queue.Queue()        # Microphone -> transcription
+passthrough_queue = queue.Queue() # BlackHole -> speakers (so you can hear Zoom)
+shutdown_event = threading.Event()
 
 
-# ── Auto-detect audio devices ────────────────────────────────────────────────
+# -- Auto-detect audio devices ------------------------------------------------
 
 def find_device(name_patterns: list[str], input_only: bool = True) -> int | None:
     devices = sd.query_devices()
@@ -62,25 +62,24 @@ def find_output_device() -> int | None:
         dev = sd.query_devices(default_out)
         if "blackhole" not in dev["name"].lower() and dev["max_output_channels"] > 0:
             return default_out
-    # Fallback: find any output that's not BlackHole
     for i, d in enumerate(sd.query_devices()):
         if d["max_output_channels"] > 0 and "blackhole" not in d["name"].lower():
             return i
     return None
 
 
-def detect_devices() -> tuple[int, int]:
+def detect_devices() -> tuple[int, int | None]:
     blackhole = find_device(["blackhole"], input_only=True)
     if blackhole is None:
-        print("[meeting] ❌ BlackHole not found! Install: brew install blackhole-2ch", file=sys.stderr)
+        print("[meeting] BlackHole not found! Install: brew install blackhole-2ch", file=sys.stderr)
         for i, d in enumerate(sd.query_devices()):
             if d["max_input_channels"] > 0:
                 print(f"  [{i}] {d['name']}", file=sys.stderr)
         sys.exit(1)
 
     mic = find_device([
-        "микрофон macbook", "macbook air micro", "macbook pro micro",
-        "built-in micro", "internal micro", "микрофон", "microphone",
+        "macbook air micro", "macbook pro micro",
+        "built-in micro", "internal micro", "microphone",
     ], input_only=True)
 
     if mic is None:
@@ -89,16 +88,16 @@ def detect_devices() -> tuple[int, int]:
             mic = default_input
 
     if mic is None:
-        print("[meeting] ⚠️ No microphone found — recording system audio only", file=sys.stderr)
+        print("[meeting] No microphone found — recording system audio only", file=sys.stderr)
 
     bh_name = sd.query_devices(blackhole)["name"]
-    print(f"[meeting] 🎧 System audio: [{blackhole}] {bh_name}", flush=True)
+    print(f"[meeting] System audio: [{blackhole}] {bh_name}", flush=True)
     if mic is not None:
-        print(f"[meeting] 🎤 Microphone:   [{mic}] {sd.query_devices(mic)['name']}", flush=True)
+        print(f"[meeting] Microphone:   [{mic}] {sd.query_devices(mic)['name']}", flush=True)
     return blackhole, mic
 
 
-# ── Audio callbacks ──────────────────────────────────────────────────────────
+# -- Audio callbacks ----------------------------------------------------------
 
 def blackhole_callback(indata, frames, time, status):
     if status and "input" not in str(status).lower():
@@ -114,20 +113,28 @@ def mic_callback(indata, frames, time, status):
     mic_queue.put(indata.copy())
 
 
-# ── Passthrough thread (BlackHole → speakers/headphones) ─────────────────────
+# -- Passthrough thread (BlackHole -> speakers/headphones) --------------------
+
+def _resample_linear(data: np.ndarray, src_rate: int, dst_rate: int) -> np.ndarray:
+    """Resample audio using linear interpolation (much better than nearest-neighbor)."""
+    if src_rate == dst_rate:
+        return data
+    duration = len(data) / src_rate
+    src_time = np.linspace(0, duration, len(data), endpoint=False)
+    dst_samples = int(duration * dst_rate)
+    dst_time = np.linspace(0, duration, dst_samples, endpoint=False)
+    return np.interp(dst_time, src_time, data).astype(np.float32)
+
 
 def passthrough_thread():
     """Play captured Zoom audio to the current default output device.
     Automatically follows headphone plug/unplug because we re-check
     the default output device periodically."""
-    global running
 
     current_output = None
     stream = None
-    buffer = np.zeros(0, dtype=np.float32)
 
-    while running:
-        # Check if output device changed (headphones plugged/unplugged)
+    while not shutdown_event.is_set():
         new_output = find_output_device()
         if new_output != current_output:
             if stream is not None:
@@ -150,22 +157,17 @@ def passthrough_thread():
                     )
                     stream.start()
                     dev_name = dev_info["name"]
-                    print(f"[passthrough] 🔊 Audio → [{current_output}] {dev_name}", flush=True)
+                    print(f"[passthrough] Audio -> [{current_output}] {dev_name}", flush=True)
                 except Exception as e:
-                    print(f"[passthrough] ⚠️ Cannot open output: {e}", file=sys.stderr)
+                    print(f"[passthrough] Cannot open output: {e}", file=sys.stderr)
                     stream = None
 
-        # Get audio data from passthrough queue
         try:
             chunk = passthrough_queue.get(timeout=0.5)
             if stream is not None:
-                # Resample if needed (16kHz capture → output rate)
                 data = chunk.flatten()
                 if stream.samplerate != SAMPLE_RATE:
-                    ratio = stream.samplerate / SAMPLE_RATE
-                    indices = np.arange(0, len(data), 1.0 / ratio)[:int(len(data) * ratio)]
-                    indices = np.clip(indices.astype(int), 0, len(data) - 1)
-                    data = data[indices]
+                    data = _resample_linear(data, SAMPLE_RATE, int(stream.samplerate))
                 try:
                     stream.write(data.reshape(-1, 1))
                 except Exception:
@@ -181,7 +183,7 @@ def passthrough_thread():
             pass
 
 
-# ── Transcription ────────────────────────────────────────────────────────────
+# -- Transcription ------------------------------------------------------------
 
 def format_time(dt: datetime) -> str:
     return dt.strftime("%H:%M:%S")
@@ -196,14 +198,13 @@ def transcribe_chunk(model, audio_np: np.ndarray) -> str:
 
 
 def writer_thread(model, has_mic: bool):
-    global running
     buffer_bh = []
     buffer_mic = []
     chunk_start = datetime.now()
 
-    print(f"[meeting] Recording... transcript → {TRANSCRIPT_FILE}", flush=True)
+    print(f"[meeting] Recording... transcript -> {TRANSCRIPT_FILE}", flush=True)
 
-    while running or not audio_queue.empty() or not mic_queue.empty():
+    while not shutdown_event.is_set() or not audio_queue.empty() or not mic_queue.empty():
         try:
             buffer_bh.append(audio_queue.get(timeout=0.5))
         except queue.Empty:
@@ -233,14 +234,14 @@ def writer_thread(model, has_mic: bool):
             buffer_mic = []
             chunk_end = datetime.now()
 
-            print(f"[meeting] Transcribing {format_time(chunk_start)}–{format_time(chunk_end)}...", flush=True)
+            print(f"[meeting] Transcribing {format_time(chunk_start)}-{format_time(chunk_end)}...", flush=True)
             text = transcribe_chunk(model, audio_mixed)
 
             if text:
-                line = f"[{format_time(chunk_start)}–{format_time(chunk_end)}] {text}\n"
+                line = f"[{format_time(chunk_start)}-{format_time(chunk_end)}] {text}\n"
                 with open(TRANSCRIPT_FILE, "a", encoding="utf-8") as f:
                     f.write(line)
-                print(f"[meeting] → {text[:80]}...", flush=True)
+                print(f"[meeting] -> {text[:80]}...", flush=True)
             else:
                 print("[meeting] (silence)", flush=True)
             chunk_start = chunk_end
@@ -251,15 +252,13 @@ def writer_thread(model, has_mic: bool):
         text = transcribe_chunk(model, audio)
         if text:
             with open(TRANSCRIPT_FILE, "a", encoding="utf-8") as f:
-                f.write(f"[{format_time(chunk_start)}–{format_time(datetime.now())}] {text}\n")
+                f.write(f"[{format_time(chunk_start)}-{format_time(datetime.now())}] {text}\n")
     print("[meeting] Done.", flush=True)
 
 
-# ── Main ─────────────────────────────────────────────────────────────────────
+# -- Main --------------------------------------------------------------------
 
 def main():
-    global running
-
     blackhole_device, mic_device = detect_devices()
     has_mic = mic_device is not None
 
@@ -274,29 +273,25 @@ def main():
     print("[meeting] Model ready.", flush=True)
 
     def handle_signal(sig, frame):
-        global running
         print("\n[meeting] Stopping...", flush=True)
-        running = False
+        shutdown_event.set()
 
     signal.signal(signal.SIGINT, handle_signal)
     signal.signal(signal.SIGTERM, handle_signal)
 
-    # Start passthrough thread (Zoom audio → your speakers/headphones)
     if ENABLE_PASSTHROUGH:
         out_dev = find_output_device()
         if out_dev is not None:
-            print(f"[meeting] 🔊 Passthrough: Zoom audio → {sd.query_devices(out_dev)['name']}", flush=True)
-            print(f"[meeting] 🔌 Plug/unplug headphones — audio follows automatically", flush=True)
+            print(f"[meeting] Passthrough: Zoom audio -> {sd.query_devices(out_dev)['name']}", flush=True)
+            print(f"[meeting] Plug/unplug headphones — audio follows automatically", flush=True)
         pt = threading.Thread(target=passthrough_thread, daemon=True)
         pt.start()
     else:
         print("[meeting] Passthrough disabled (set PASSTHROUGH=1 to enable)", flush=True)
 
-    # Start transcription writer
     wt = threading.Thread(target=writer_thread, args=(model, has_mic), daemon=False)
     wt.start()
 
-    # Open audio input streams
     streams = [
         sd.InputStream(
             device=blackhole_device, samplerate=SAMPLE_RATE, channels=CHANNELS,
@@ -309,19 +304,18 @@ def main():
             dtype="float32", callback=mic_callback, blocksize=SAMPLE_RATE,
         ))
 
-    # Context manager for multiple streams
     for s in streams:
         s.start()
 
-    print(f"[meeting] 🔴 Recording...", flush=True)
+    print(f"[meeting] Recording...", flush=True)
     try:
-        while running:
-            sd.sleep(500)
+        while not shutdown_event.is_set():
+            shutdown_event.wait(timeout=0.5)
     finally:
         for s in streams:
             s.stop()
             s.close()
-        running = False
+        shutdown_event.set()
         wt.join()
 
 
