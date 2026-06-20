@@ -122,7 +122,7 @@ launchctl bootout "gui/$(id -u)/$LAUNCH_LABEL" 2>/dev/null || true
 # ── 5. Copy files ────────────────────────────────────────────────────────────
 say "Installing to $INSTALL_DIR..."
 mkdir -p "$INSTALL_DIR/transcripts"
-for f in server.py capture.py watcher.py setup-audio.sh requirements.txt update.sh; do
+for f in server.py capture.py watcher.py setup-audio.sh requirements.txt update.sh create-multi-output.swift; do
     [[ -f "$SCRIPT_DIR/$f" ]] && cp "$SCRIPT_DIR/$f" "$INSTALL_DIR/"
 done
 chmod +x "$INSTALL_DIR/setup-audio.sh" 2>/dev/null || true

@@ -7,6 +7,7 @@ __pycache__/
 *.egg-info/
 dist/
 build/
+.build/
 transcripts/
 watcher.log
 .DS_Store
