@@ -1,0 +1,16 @@
+startCommand:
+  type: stdio
+  configSchema:
+    type: object
+    properties:
+      WHISPER_MODEL:
+        type: string
+        default: "small"
+        description: "Whisper model size (tiny, base, small, medium, large-v3)"
+      DIARIZATION:
+        type: string
+        default: "1"
+        description: "Enable speaker labels ([You] vs [Remote])"
+  commandFunction:
+    - python3
+    - server.py

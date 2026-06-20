@@ -1,6 +1,7 @@
 # Meeting Transcript MCP
 
-[![macOS](https://img.shields.io/badge/platform-macOS-blue)](https://github.com/m0rvayne/meeting-transcript-mcp)
+[![Tests](https://github.com/m0rvayne/meeting-transcript-mcp/actions/workflows/test.yml/badge.svg)](https://github.com/m0rvayne/meeting-transcript-mcp/actions)
+[![macOS](https://img.shields.io/badge/platform-macOS_12%2B-blue)](https://github.com/m0rvayne/meeting-transcript-mcp)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-brightgreen)](https://python.org)
 [![License: MIT](https://img.shields.io/badge/license-MIT-yellow)](LICENSE)
 [![MCP](https://img.shields.io/badge/protocol-MCP-purple)](https://modelcontextprotocol.io)
