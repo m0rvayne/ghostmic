@@ -14,6 +14,7 @@ First public release.
 - One-command installer (BlackHole, Python venv, Whisper model, Claude Desktop config, LaunchAgent)
 - Background daemon with crash backoff, grace period, atomic symlink replacement
 - Swift CLI for Multi-Output Device creation (no Node.js dependency)
+- Menu bar indicator (red dot when recording, pause when idle)
 - Uninstall script with transcript preservation option
 
 ### Architecture
@@ -22,7 +23,8 @@ First public release.
 - RotatingFileHandler logging (10MB, 3 backups)
 - Path traversal defense with symlink rejection and boundary checks
 - Language detection lock (detect once, use for all chunks)
+- Status file (watcher-status.json) for menu bar communication
 
 ### Testing
-- 90 tests (76 unit + 7 integration + 7 Google Meet/status)
+- 86 tests (unit + integration via MCP SDK stdio_client)
 - CI: pytest on Python 3.10/3.12/3.13, Swift build on macOS 15, shell syntax checks

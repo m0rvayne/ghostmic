@@ -11,7 +11,6 @@ import fcntl
 import json
 import logging
 import os
-import re
 import sys
 import time
 import signal
@@ -188,62 +187,9 @@ def zoom_local_api_active() -> bool:
         return False
 
 
-_MEET_CODE_RE = re.compile(r'^[a-z]{2,5}-[a-z]{2,5}-[a-z]{2,5}$')
-
-_BROWSERS = ["Google Chrome", "Safari", "Arc", "Microsoft Edge", "Brave Browser"]
-
-
-def _get_running_browsers() -> list[str]:
-    """Return names of browsers that are currently running."""
-    try:
-        checks = " ".join(
-            f'if procNames contains "{name}" then set bl to bl & "{name},"'
-            for name in _BROWSERS
-        )
-        r = subprocess.run(
-            ["osascript", "-e", f'''tell application "System Events"
-    set procNames to name of every process
-    set bl to ""
-    {checks}
-    return bl
-end tell'''],
-            capture_output=True, text=True, timeout=5
-        )
-        return [b.strip() for b in r.stdout.strip().split(",") if b.strip()]
-    except Exception:
-        return []
-
-
-def google_meet_active() -> bool:
-    """Check running browsers for an active Google Meet tab via AppleScript."""
-    for app_name in _get_running_browsers():
-        try:
-            r = subprocess.run(
-                ["osascript", "-e", f'''tell application "{app_name}"
-    repeat with w in windows
-        repeat with t in tabs of w
-            if URL of t contains "meet.google.com/" then
-                return URL of t
-            end if
-        end repeat
-    end repeat
-    return ""
-end tell'''],
-                capture_output=True, text=True, timeout=5
-            )
-            url = r.stdout.strip()
-            if url and "meet.google.com/" in url:
-                path = url.split("meet.google.com/")[1].split("?")[0].split("#")[0].rstrip("/")
-                if path and path not in ("landing", "new", "join", "") and _MEET_CODE_RE.match(path):
-                    return True
-        except Exception:
-            continue
-    return False
-
-
 def is_in_conference() -> bool:
-    """Return True if user is in a Zoom or Google Meet call."""
-    return zoom_cpthost_running() or zoom_local_api_active() or google_meet_active()
+    """Return True if user is currently in a Zoom meeting."""
+    return zoom_cpthost_running() or zoom_local_api_active()
 
 
 # --------------------------------------------------------------------------
@@ -387,14 +333,14 @@ def tick(ctx: WatcherContext):
             logger.info("Meeting reconnected during grace period")
         ctx.grace_start = None
         if not is_recording:
-            logger.info("Zoom meeting detected — starting capture")
+            logger.info("Meeting detected — starting capture")
             start_capture(ctx)
     else:
         if is_recording:
             if ctx.grace_start is None:
                 ctx.grace_start = time.time()
                 ctx.state = State.GRACE_PERIOD
-                logger.info(f"Zoom meeting ended — waiting {ctx.config.grace_period}s grace period...")
+                logger.info(f"Meeting ended — waiting {ctx.config.grace_period}s grace period...")
             elif time.time() - ctx.grace_start >= ctx.config.grace_period:
                 logger.info("Grace period elapsed — stopping capture")
                 stop_capture(ctx)
@@ -417,6 +363,7 @@ def main():
     signal.signal(signal.SIGTERM, handle_signal)
     signal.signal(signal.SIGINT, handle_signal)
 
+    write_status(config, "IDLE")
     logger.info("Watcher started. Monitoring for Zoom meetings...")
 
     while ctx.running:
@@ -426,6 +373,7 @@ def main():
     logger.info("Shutting down watcher...")
     if ctx.capture_process and ctx.capture_process.poll() is None:
         stop_capture(ctx)
+    write_status(config, "IDLE")
 
 
 if __name__ == "__main__":
