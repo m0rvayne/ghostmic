@@ -3,14 +3,21 @@ startCommand:
   configSchema:
     type: object
     properties:
-      WHISPER_MODEL:
+      whisperModel:
         type: string
         default: "small"
         description: "Whisper model size (tiny, base, small, medium, large-v3)"
-      DIARIZATION:
+      diarization:
         type: string
         default: "1"
-        description: "Enable speaker labels ([You] vs [Remote])"
+        description: "Enable speaker labels ([You] vs [Remote]). Set to 0 to disable."
   commandFunction:
-    - python3
-    - server.py
+    |-
+    (config) => ({
+      command: 'python3',
+      args: ['server.py'],
+      env: {
+        WHISPER_MODEL: config.whisperModel || 'small',
+        DIARIZATION: config.diarization || '1'
+      }
+    })

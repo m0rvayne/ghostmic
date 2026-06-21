@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "meeting-transcript-mcp"
-version = "0.1.0"
+version = "1.0.0"
 description = "Live Zoom transcription via BlackHole + Whisper AI, served to Claude through MCP"
 readme = "README.md"
 license = "MIT"
@@ -19,7 +19,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-test = ["pytest"]
+test = ["pytest", "pytest-asyncio"]
 
 [project.urls]
 Repository = "https://github.com/m0rvayne/meeting-transcript-mcp"
@@ -29,3 +29,4 @@ py-modules = ["server", "capture", "watcher"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+asyncio_mode = "auto"

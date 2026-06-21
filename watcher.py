@@ -78,6 +78,7 @@ class WatcherContext:
     current_transcript: Optional[Path] = None
     grace_start: Optional[float] = None
     crash_times: list[float] = field(default_factory=list)
+    backoff_until: Optional[float] = None
     running: bool = True
 
 
@@ -213,11 +214,8 @@ def start_capture(ctx: WatcherContext):
         logger.warning(f"capture.py crashed {config.max_rapid_crashes} times in {config.crash_window}s — backing off 60s")
         ctx.crash_times.clear()
         ctx.state = State.BACKOFF
-        for _ in range(60):
-            if not ctx.running:
-                return
-            time.sleep(1)
-        ctx.state = State.IDLE
+        ctx.backoff_until = now + 60.0
+        return
 
     timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
     ctx.current_transcript = config.transcripts_dir / f"{timestamp}.txt"
@@ -289,6 +287,14 @@ def notify(title: str, message: str):
 
 def tick(ctx: WatcherContext):
     """Single iteration of the watcher state machine."""
+    # Handle backoff: return early until timer expires
+    if ctx.state == State.BACKOFF:
+        if time.time() < ctx.backoff_until:
+            return
+        logger.info("Backoff period ended — resuming normal operation")
+        ctx.state = State.IDLE
+        ctx.backoff_until = None
+
     try:
         in_conf = is_in_conference()
     except Exception as e:

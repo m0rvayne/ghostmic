@@ -7,7 +7,7 @@ on:
     branches: [main]
 
 jobs:
-  python-tests:
+  unit-tests:
     runs-on: ubuntu-latest
     strategy:
       matrix:
@@ -18,7 +18,17 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
       - run: pip install -e ".[test]"
-      - run: pytest -v
+      - run: pytest tests/test_server.py tests/test_capture.py tests/test_watcher.py -v
+
+  integration-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -e ".[test]"
+      - run: pytest tests/test_integration.py -v
 
   swift-build:
     runs-on: macos-15
