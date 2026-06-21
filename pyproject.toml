@@ -22,13 +22,13 @@ dependencies = [
 test = ["pytest", "pytest-asyncio"]
 
 [project.scripts]
-meeting-transcript-mcp = "server:main"
+meeting-transcript-mcp = "meeting_transcript_mcp:main"
 
 [project.urls]
 Repository = "https://github.com/m0rvayne/meeting-transcript-mcp"
 
 [tool.setuptools]
-py-modules = ["server", "capture", "watcher"]
+packages = ["meeting_transcript_mcp"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

@@ -16,6 +16,12 @@ SERVER_SCRIPT = PROJECT_DIR / "server.py"
 TRANSCRIPTS_DIR = PROJECT_DIR / "transcripts"
 
 
+def _test_filename(base: str) -> str:
+    """Generate a unique test filename that won't collide with real transcripts."""
+    import secrets
+    return f"_test_{secrets.token_hex(4)}_{base}"
+
+
 def _write_transcript(filename: str, content: str) -> Path:
     TRANSCRIPTS_DIR.mkdir(exist_ok=True)
     path = TRANSCRIPTS_DIR / filename
@@ -71,12 +77,12 @@ class TestMCPIntegration:
         _sync_run(check)
 
     def test_read_past_meeting(self):
-        f = _write_transcript("integ-test-read.txt",
+        f = _write_transcript("_test_integ_read.txt",
                               "[00:00:05-00:00:35] Hello from integration test.\n")
         try:
             async def check(session):
                 result = await session.call_tool("read_past_meeting",
-                                                 {"filename": "integ-test-read.txt"})
+                                                 {"filename": "_test_integ_read.txt"})
                 assert not result.isError
                 assert "Hello from integration test" in result.content[0].text
             _sync_run(check)
@@ -92,7 +98,7 @@ class TestMCPIntegration:
         _sync_run(check)
 
     def test_search_transcripts(self):
-        f = _write_transcript("integ-test-search.txt",
+        f = _write_transcript("_test_integ_search.txt",
                               "[00:00:10-00:00:40] We discussed the quarterly budget.\n")
         try:
             async def check(session):
@@ -111,12 +117,12 @@ class TestMCPIntegration:
         _sync_run(check)
 
     def test_meeting_notes_prompt_has_salted_tags(self):
-        f = _write_transcript("integ-test-prompt.txt",
+        f = _write_transcript("_test_integ_prompt.txt",
                               "[00:00:05-00:00:35] Let's discuss the product roadmap.\n")
         try:
             async def check(session):
                 result = await session.get_prompt("meeting-notes",
-                                                  {"filename": "integ-test-prompt.txt"})
+                                                  {"filename": "_test_integ_prompt.txt"})
                 text = result.messages[0].content.text
                 assert "roadmap" in text
                 assert "<transcript-" in text
