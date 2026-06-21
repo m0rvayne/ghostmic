@@ -188,6 +188,15 @@ class TestStatusFile:
         assert "transcript" not in status
 
 
+class TestDefaultConfig:
+    def test_default_config_creates_without_error(self):
+        """Regression test: default_config() must not raise TypeError."""
+        config = watcher.default_config()
+        assert config.install_dir is not None
+        assert config.status_file is not None
+        assert config.status_file.name == "watcher-status.json"
+
+
 class TestTickStateMachine:
     def test_idle_no_conference(self, ctx):
         with patch.object(watcher, "is_in_conference", return_value=False):

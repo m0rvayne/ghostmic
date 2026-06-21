@@ -43,6 +43,7 @@ class WatcherConfig:
     grace_period: float = 15.0
     max_rapid_crashes: int = 3
     crash_window: float = 60.0
+    status_file: Optional[Path] = None
     log_max_bytes: int = 10 * 1024 * 1024
     log_backup_count: int = 3
 
@@ -249,17 +250,14 @@ def is_in_conference() -> bool:
 # Status file (for menu bar indicator)
 # --------------------------------------------------------------------------
 
-def _status_path(config: WatcherConfig) -> Path:
-    return config.install_dir / "watcher-status.json"
-
-
 def write_status(config: WatcherConfig, state: str, transcript: str = None):
     """Write status JSON for the menu bar indicator to read."""
     data = {"state": state, "timestamp": time.time()}
     if transcript:
         data["transcript"] = transcript
     try:
-        _status_path(config).write_text(json.dumps(data), encoding="utf-8")
+        path = config.status_file or (config.install_dir / "watcher-status.json")
+        path.write_text(json.dumps(data), encoding="utf-8")
     except Exception:
         pass
 

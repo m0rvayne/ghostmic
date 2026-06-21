@@ -24,5 +24,5 @@ First public release.
 - Language detection lock (detect once, use for all chunks)
 
 ### Testing
-- 83 tests (76 unit + 7 integration via MCP SDK stdio_client)
+- 90 tests (76 unit + 7 integration + 7 Google Meet/status)
 - CI: pytest on Python 3.10/3.12/3.13, Swift build on macOS 15, shell syntax checks
