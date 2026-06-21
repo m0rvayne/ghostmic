@@ -178,7 +178,7 @@ bash uninstall.sh                               # Clean removal (asks before del
 
 ## Contributing
 
-See [CONTRIBUTING.md](CONTRIBUTING.md). 90 tests, all green.
+See [CONTRIBUTING.md](CONTRIBUTING.md). 86 tests, all green.
 
 ## License
 
