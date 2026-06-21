@@ -2,9 +2,9 @@
 
 # Meeting Transcript MCP
 
-**Claude knows what you're discussing right now.**
+**Give Claude context about your Zoom meetings.**
 
-Live Zoom transcription, running entirely on your Mac. No cloud, no API keys, no third-party accounts.
+Local Whisper transcription piped to Claude through MCP. Transcription never leaves your Mac.
 
 [![Tests](https://github.com/m0rvayne/meeting-transcript-mcp/actions/workflows/test.yml/badge.svg)](https://github.com/m0rvayne/meeting-transcript-mcp/actions)
 [![macOS 12+](https://img.shields.io/badge/platform-macOS_12%2B-blue)](https://github.com/m0rvayne/meeting-transcript-mcp)
@@ -12,47 +12,48 @@ Live Zoom transcription, running entirely on your Mac. No cloud, no API keys, no
 [![License: MIT](https://img.shields.io/badge/license-MIT-yellow)](LICENSE)
 [![MCP](https://img.shields.io/badge/protocol-MCP-purple)](https://modelcontextprotocol.io)
 
-<!-- Replace with actual demo GIF: -->
-<!-- ![Demo](assets/demo.gif) -->
-
 </div>
 
 ---
 
 ## Why?
 
-You're on a Zoom call. Someone mentions a decision from 20 minutes ago. You didn't take notes. You can't rewind a live meeting.
+You're on a Zoom call. Someone references a decision from 20 minutes ago. You didn't take notes. You can't rewind a live meeting.
 
-Cloud transcription tools exist — but they upload your private conversations to external servers, require paid accounts, and only give you a transcript *after* the meeting ends.
+Cloud transcription tools exist — but they upload your conversations to external servers and only give you a transcript after the call ends.
 
-**Meeting Transcript MCP** works differently:
+This connector runs Whisper AI on your Mac and delivers the transcript to Claude as the meeting happens. Transcription is fully local — audio never leaves your machine. When you ask Claude a question, it reads the latest transcript from disk.
 
-- **Local-only.** Whisper AI runs on your Mac. Audio never leaves your machine.
-- **Real-time.** Claude sees the transcript as words are spoken. Ask questions mid-meeting.
-- **Zero friction.** Detects Zoom calls automatically. No buttons to press, nothing to start.
-- **Speaker labels.** Distinguishes `[You]` from `[Remote]` using dual-channel audio analysis.
-- **No accounts.** No signup, no API keys for transcription, no cloud dependency.
+**What it does:**
+
+- **Local transcription.** Whisper runs on-device. No cloud APIs for speech-to-text.
+- **Near-real-time.** Transcript updates every ~30 seconds (one Whisper chunk). Claude reads the latest version when you ask.
+- **Auto-detection.** A background daemon detects Zoom meetings and starts/stops recording. No buttons to press during the meeting.
+- **Speaker labels.** Tags `[You]` vs `[Remote]` using energy comparison between mic and system audio channels. Not ML-based diarization — a simple but effective heuristic for two-party calls.
+- **Meeting notes.** Structured summaries via MCP Prompt — Claude organizes topics, decisions, and action items from the transcript.
 
 ## Features
 
 | Feature | Description |
 |---------|-------------|
-| Live transcript | Claude reads what's being said as it happens |
-| Speaker diarization | `[You]` vs `[Remote]` labels via mic/system audio channels |
-| Meeting notes | Structured summaries with topics, decisions, and action items |
-| Search | Find past discussions: "when did we discuss the budget?" |
-| Auto-detection | LaunchAgent daemon detects Zoom meetings, starts/stops recording |
-| Status check | Ask Claude if recording is active, how many meetings are saved |
+| Live transcript | Transcript updates every ~30s, Claude reads on demand |
+| Speaker labels | `[You]` vs `[Remote]` via dual-channel energy comparison |
+| Meeting notes | Structured summaries with topics, decisions, action items |
+| Search | Substring search across all past transcripts |
+| Auto-detection | LaunchAgent daemon polls for Zoom process every 5s |
+| Status | Check if recording is active, transcript count, disk space |
 
 ## Quick Start
 
-**1. Install** (one command):
+> **Prerequisites:** macOS 12+, Xcode Command Line Tools (`xcode-select --install`), ~2 GB disk space (Whisper model + dependencies).
+
+**1. Install:**
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/m0rvayne/meeting-transcript-mcp/main/install.sh | bash
 ```
 
-This sets up everything: BlackHole audio driver, Python venv, Whisper model (~500 MB), Claude Desktop config, and a background daemon.
+This installs BlackHole audio driver, creates a Python venv with Whisper, configures Claude Desktop, and sets up a background daemon (LaunchAgent). Takes 5-10 minutes on first run (Whisper model download is ~500 MB).
 
 **2. Configure Zoom** (one-time):
 
@@ -60,12 +61,14 @@ This sets up everything: BlackHole audio driver, Python venv, Whisper model (~50
 
 **3. Use it:**
 
-Join a Zoom call. Claude already knows what's being said. Ask:
+Join a Zoom call. The daemon detects it and starts recording. In Claude:
 
 - *"What are they talking about?"*
 - *"Summarize the last 10 minutes"*
 - *"Make meeting notes"*
 - *"Search meetings for 'product launch'"*
+
+> Note: Claude reads the transcript when you ask — it does not stream or push updates automatically.
 
 ## How It Works
 
@@ -86,11 +89,13 @@ BlackHole 2ch (virtual audio driver)
            BlackHole)           Claude Desktop / Claude Code
 ```
 
-**watcher.py** runs as a LaunchAgent — detects Zoom meetings via `CptHost` process and port 19421, starts/stops capture automatically.
+**watcher.py** runs as a LaunchAgent (persistent background process, starts on login). It polls for `CptHost` (Zoom's in-meeting process) every 5 seconds and spawns/kills **capture.py** accordingly.
 
-**Speaker diarization** uses the fact that BlackHole captures only remote audio (virtual device, zero mic bleed), while the microphone captures your voice. Energy ratio between the two channels determines who is speaking — no ML models, no extra dependencies.
+**capture.py** opens two audio streams: BlackHole (remote participants) and microphone (you). Buffers audio while Whisper model loads, transcribes in 30-second chunks, writes timestamped lines to a transcript file.
 
-**Meeting notes** use an MCP Prompt with salted XML tags and anti-hallucination rules. Claude structures the transcript into topics, decisions, action items, and key takeaways — using only what was actually said.
+**Speaker labels** use the fact that BlackHole captures only system audio (virtual device, no mic bleed) while the microphone captures your voice. Energy ratio between the two channels determines the label. This works well for two-party calls; it cannot distinguish between multiple remote speakers.
+
+**server.py** is the MCP server (stdio transport). It reads transcript files from disk and serves them to Claude via 5 tools, 1 prompt, and MCP resources.
 
 ## Configuration
 
@@ -104,13 +109,24 @@ BlackHole 2ch (virtual audio driver)
 
 | Tool | What it does |
 |------|-------------|
-| `read_meeting_transcript` | Read the live or most recent transcript |
+| `read_meeting_transcript` | Read the current or most recent transcript |
 | `list_past_meetings` | List all recorded sessions with sizes |
-| `read_past_meeting` | Read a specific past transcript |
-| `search_transcripts` | Full-text search across all past meetings |
-| `get_status` | Check if watcher/recording is active, disk space |
+| `read_past_meeting` | Read a specific past transcript by filename |
+| `search_transcripts` | Substring search across all past meetings |
+| `get_status` | Watcher state, recording state, disk space |
 
-Plus: `meeting-notes` prompt for structured note generation, and MCP resources for passive transcript access.
+**Prompt:** `meeting-notes` — generates structured notes (topics, decisions, action items) from a transcript. Uses salted XML delimiters for prompt injection protection.
+
+**Resources:** `meeting://current/transcript`, `meeting://past/{filename}`
+
+## Limitations
+
+- **Zoom only.** Google Meet and Teams support is planned but not implemented.
+- **macOS only.** Requires BlackHole (macOS audio driver), CoreAudio, LaunchAgent.
+- **~30 second latency.** Whisper processes audio in 30-second chunks. On slower hardware (Intel, `medium`/`large` models), latency can be higher.
+- **Two-party speaker labels only.** Cannot distinguish between multiple remote speakers.
+- **Headphone switching.** Changing audio output requires re-running `bash ~/.meeting-transcript-mcp/setup-audio.sh`.
+- **No visual indicator.** There is no menu bar icon or notification showing recording status. Use `get_status` tool or check logs.
 
 <details>
 <summary><strong>Troubleshooting</strong></summary>
@@ -145,7 +161,7 @@ launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.meeting-transcript.w
 
 **Transcript is empty**
 
-1. Verify Zoom speaker is "Zoom + Transcript" (not "MacBook Speakers")
+1. Verify Zoom speaker is "Zoom + Transcript"
 2. Check devices: `~/.meeting-transcript-mcp/.venv/bin/python3 -c "import sounddevice; print(sounddevice.query_devices())"`
 3. Check logs: `tail -50 ~/.meeting-transcript-mcp/watcher.log`
 
@@ -158,15 +174,9 @@ cd meeting-transcript-mcp && bash update.sh    # Update
 bash uninstall.sh                               # Clean removal (asks before deleting transcripts)
 ```
 
-## Requirements
-
-macOS 12 or later. Apple Silicon or Intel. ~1.5 GB disk space.
-
-> **Currently supports Zoom.** Google Meet and Teams support is planned.
-
 ## Contributing
 
-See [CONTRIBUTING.md](CONTRIBUTING.md).
+See [CONTRIBUTING.md](CONTRIBUTING.md). 83 tests, all green.
 
 ## License
 
