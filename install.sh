@@ -122,7 +122,7 @@ launchctl bootout "gui/$(id -u)/$LAUNCH_LABEL" 2>/dev/null || true
 # ── 5. Copy files ────────────────────────────────────────────────────────────
 say "Installing to $INSTALL_DIR..."
 mkdir -p "$INSTALL_DIR/transcripts"
-for f in server.py capture.py watcher.py setup-audio.sh requirements.txt update.sh create-multi-output.swift; do
+for f in server.py capture.py watcher.py setup-audio.sh requirements.txt update.sh create-multi-output.swift statusbar.swift; do
     [[ -f "$SCRIPT_DIR/$f" ]] && cp "$SCRIPT_DIR/$f" "$INSTALL_DIR/"
 done
 chmod +x "$INSTALL_DIR/setup-audio.sh" 2>/dev/null || true
@@ -233,6 +233,42 @@ PLISTEOF
 
 launchctl bootstrap "gui/$(id -u)" "$PLIST_PATH" 2>/dev/null || launchctl load "$PLIST_PATH" 2>/dev/null
 ok "Watcher auto-start configured (survives reboot)"
+
+# ── 11. Menu bar indicator ──────────────────────────────────────────────────
+say "Building menu bar indicator..."
+STATUSBAR_LABEL="com.meeting-transcript.statusbar"
+STATUSBAR_BIN="$INSTALL_DIR/.build/statusbar"
+if command -v swiftc &>/dev/null; then
+    mkdir -p "$INSTALL_DIR/.build"
+    if swiftc -O -framework AppKit "$INSTALL_DIR/statusbar.swift" -o "$STATUSBAR_BIN" 2>&1; then
+        STATUSBAR_PLIST="$HOME/Library/LaunchAgents/$STATUSBAR_LABEL.plist"
+        launchctl bootout "gui/$(id -u)/$STATUSBAR_LABEL" 2>/dev/null || true
+        cat > "$STATUSBAR_PLIST" << SBPLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>$STATUSBAR_LABEL</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>$STATUSBAR_BIN</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+</dict>
+</plist>
+SBPLIST
+        launchctl bootstrap "gui/$(id -u)" "$STATUSBAR_PLIST" 2>/dev/null || launchctl load "$STATUSBAR_PLIST" 2>/dev/null
+        ok "Menu bar indicator installed (shows recording status)"
+    else
+        warn "Could not compile menu bar indicator — skipping"
+    fi
+else
+    warn "swiftc not found — menu bar indicator skipped"
+fi
 
 # ── Done ─────────────────────────────────────────────────────────────────────
 cat << SUMMARY

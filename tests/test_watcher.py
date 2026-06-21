@@ -136,6 +136,58 @@ class TestZoomDetection:
             assert watcher.zoom_local_api_active() is False
 
 
+class TestGoogleMeetDetection:
+    def test_meet_code_regex_valid(self):
+        assert watcher._MEET_CODE_RE.match("abc-defg-hij")
+        assert watcher._MEET_CODE_RE.match("ab-cd-ef")
+
+    def test_meet_code_regex_invalid(self):
+        assert not watcher._MEET_CODE_RE.match("landing")
+        assert not watcher._MEET_CODE_RE.match("new")
+        assert not watcher._MEET_CODE_RE.match("")
+        assert not watcher._MEET_CODE_RE.match("ABC-DEF-GHI")  # uppercase
+        assert not watcher._MEET_CODE_RE.match("a-b-c")  # too short
+
+    def test_no_browsers_running(self):
+        with patch.object(watcher, "_get_running_browsers", return_value=[]):
+            assert watcher.google_meet_active() is False
+
+    def test_browser_with_meet_tab(self):
+        with patch.object(watcher, "_get_running_browsers", return_value=["Google Chrome"]), \
+             patch("subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(
+                stdout="https://meet.google.com/abc-defg-hij",
+                returncode=0
+            )
+            assert watcher.google_meet_active() is True
+
+    def test_browser_with_meet_homepage(self):
+        """meet.google.com without a meeting code should NOT trigger."""
+        with patch.object(watcher, "_get_running_browsers", return_value=["Google Chrome"]), \
+             patch("subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(
+                stdout="https://meet.google.com/landing",
+                returncode=0
+            )
+            assert watcher.google_meet_active() is False
+
+
+class TestStatusFile:
+    def test_write_status_recording(self, config):
+        watcher.write_status(config, "RECORDING", "test.txt")
+        import json
+        status = json.loads((config.install_dir / "watcher-status.json").read_text())
+        assert status["state"] == "RECORDING"
+        assert status["transcript"] == "test.txt"
+
+    def test_write_status_idle(self, config):
+        watcher.write_status(config, "IDLE")
+        import json
+        status = json.loads((config.install_dir / "watcher-status.json").read_text())
+        assert status["state"] == "IDLE"
+        assert "transcript" not in status
+
+
 class TestTickStateMachine:
     def test_idle_no_conference(self, ctx):
         with patch.object(watcher, "is_in_conference", return_value=False):

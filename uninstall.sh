@@ -23,10 +23,12 @@ cat << 'BANNER'
 BANNER
 
 # 1. Stop and remove LaunchAgent
-say "Stopping watcher daemon..."
+say "Stopping watcher daemon and menu bar indicator..."
 launchctl bootout "gui/$(id -u)/$LAUNCH_LABEL" 2>/dev/null || true
+launchctl bootout "gui/$(id -u)/com.meeting-transcript.statusbar" 2>/dev/null || true
 [[ -f "$PLIST_PATH" ]] && rm "$PLIST_PATH"
-ok "LaunchAgent removed"
+[[ -f "$HOME/Library/LaunchAgents/com.meeting-transcript.statusbar.plist" ]] && rm "$HOME/Library/LaunchAgents/com.meeting-transcript.statusbar.plist"
+ok "LaunchAgents removed"
 
 # 2. Remove MCP entry from Claude Desktop config
 if [[ -f "$CLAUDE_CONFIG" ]]; then

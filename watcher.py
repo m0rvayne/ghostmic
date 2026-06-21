@@ -8,8 +8,10 @@ Detection methods (in order of priority):
   2. Zoom Local API (port 19421) — Zoom opens it only during a meeting
 """
 import fcntl
+import json
 import logging
 import os
+import re
 import sys
 import time
 import signal
@@ -56,6 +58,7 @@ def default_config() -> WatcherConfig:
         pid_file=install_dir / "watcher.pid",
         log_file=install_dir / "watcher.log",
         symlink_path=transcripts / "meeting_transcript.txt",
+        status_file=install_dir / "watcher-status.json",
     )
 
 
@@ -164,7 +167,7 @@ def kill_orphan_capture(config: WatcherConfig):
 
 
 # --------------------------------------------------------------------------
-# Zoom Detection
+# Meeting Detection (Zoom + Google Meet)
 # --------------------------------------------------------------------------
 
 def zoom_cpthost_running() -> bool:
@@ -184,8 +187,81 @@ def zoom_local_api_active() -> bool:
         return False
 
 
+_MEET_CODE_RE = re.compile(r'^[a-z]{2,5}-[a-z]{2,5}-[a-z]{2,5}$')
+
+_BROWSERS = ["Google Chrome", "Safari", "Arc", "Microsoft Edge", "Brave Browser"]
+
+
+def _get_running_browsers() -> list[str]:
+    """Return names of browsers that are currently running."""
+    try:
+        checks = " ".join(
+            f'if procNames contains "{name}" then set bl to bl & "{name},"'
+            for name in _BROWSERS
+        )
+        r = subprocess.run(
+            ["osascript", "-e", f'''tell application "System Events"
+    set procNames to name of every process
+    set bl to ""
+    {checks}
+    return bl
+end tell'''],
+            capture_output=True, text=True, timeout=5
+        )
+        return [b.strip() for b in r.stdout.strip().split(",") if b.strip()]
+    except Exception:
+        return []
+
+
+def google_meet_active() -> bool:
+    """Check running browsers for an active Google Meet tab via AppleScript."""
+    for app_name in _get_running_browsers():
+        try:
+            r = subprocess.run(
+                ["osascript", "-e", f'''tell application "{app_name}"
+    repeat with w in windows
+        repeat with t in tabs of w
+            if URL of t contains "meet.google.com/" then
+                return URL of t
+            end if
+        end repeat
+    end repeat
+    return ""
+end tell'''],
+                capture_output=True, text=True, timeout=5
+            )
+            url = r.stdout.strip()
+            if url and "meet.google.com/" in url:
+                path = url.split("meet.google.com/")[1].split("?")[0].split("#")[0].rstrip("/")
+                if path and path not in ("landing", "new", "join", "") and _MEET_CODE_RE.match(path):
+                    return True
+        except Exception:
+            continue
+    return False
+
+
 def is_in_conference() -> bool:
-    return zoom_cpthost_running() or zoom_local_api_active()
+    """Return True if user is in a Zoom or Google Meet call."""
+    return zoom_cpthost_running() or zoom_local_api_active() or google_meet_active()
+
+
+# --------------------------------------------------------------------------
+# Status file (for menu bar indicator)
+# --------------------------------------------------------------------------
+
+def _status_path(config: WatcherConfig) -> Path:
+    return config.install_dir / "watcher-status.json"
+
+
+def write_status(config: WatcherConfig, state: str, transcript: str = None):
+    """Write status JSON for the menu bar indicator to read."""
+    data = {"state": state, "timestamp": time.time()}
+    if transcript:
+        data["transcript"] = transcript
+    try:
+        _status_path(config).write_text(json.dumps(data), encoding="utf-8")
+    except Exception:
+        pass
 
 
 # --------------------------------------------------------------------------
@@ -222,6 +298,7 @@ def start_capture(ctx: WatcherContext):
     ctx.current_transcript.touch()
 
     update_symlink(config, ctx.current_transcript)
+    write_status(config, "RECORDING", ctx.current_transcript.name)
     notify("Meeting recording started", f"Transcript: {ctx.current_transcript.name}")
 
     env = os.environ.copy()
@@ -263,6 +340,7 @@ def stop_capture(ctx: WatcherContext):
     saved_name = ctx.current_transcript.name if ctx.current_transcript else "unknown"
     ctx.capture_process = None
     ctx.current_transcript = None
+    write_status(ctx.config, "IDLE")
     ctx.state = State.IDLE
     logger.info(f"Recording stopped. Transcript: {saved_name}")
     notify("Meeting recording stopped", f"Saved: {saved_name}")

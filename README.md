@@ -28,7 +28,8 @@ This connector runs Whisper AI on your Mac and delivers the transcript to Claude
 
 - **Local transcription.** Whisper runs on-device. No cloud APIs for speech-to-text.
 - **Near-real-time.** Transcript updates every ~30 seconds (one Whisper chunk). Claude reads the latest version when you ask.
-- **Auto-detection.** A background daemon detects Zoom meetings and starts/stops recording. No buttons to press during the meeting.
+- **Auto-detection.** A background daemon detects Zoom and Google Meet calls, starts/stops recording. No buttons to press during the meeting.
+- **Menu bar indicator.** Red dot when recording, pause when idle. Always know if it's working.
 - **Speaker labels.** Tags `[You]` vs `[Remote]` using energy comparison between mic and system audio channels. Not ML-based diarization — a simple but effective heuristic for two-party calls.
 - **Meeting notes.** Structured summaries via MCP Prompt — Claude organizes topics, decisions, and action items from the transcript.
 
@@ -40,7 +41,8 @@ This connector runs Whisper AI on your Mac and delivers the transcript to Claude
 | Speaker labels | `[You]` vs `[Remote]` via dual-channel energy comparison |
 | Meeting notes | Structured summaries with topics, decisions, action items |
 | Search | Substring search across all past transcripts |
-| Auto-detection | LaunchAgent daemon polls for Zoom process every 5s |
+| Auto-detection | Detects Zoom (process) and Google Meet (browser tab) every 5s |
+| Menu bar | 🔴 when recording, ⏸ when idle |
 | Status | Check if recording is active, transcript count, disk space |
 
 ## Quick Start
@@ -121,12 +123,12 @@ BlackHole 2ch (virtual audio driver)
 
 ## Limitations
 
-- **Zoom only.** Google Meet and Teams support is planned but not implemented.
+- **Zoom and Google Meet.** Teams support is planned.
 - **macOS only.** Requires BlackHole (macOS audio driver), CoreAudio, LaunchAgent.
 - **~30 second latency.** Whisper processes audio in 30-second chunks. On slower hardware (Intel, `medium`/`large` models), latency can be higher.
 - **Two-party speaker labels only.** Cannot distinguish between multiple remote speakers.
 - **Headphone switching.** Changing audio output requires re-running `bash ~/.meeting-transcript-mcp/setup-audio.sh`.
-- **No visual indicator.** There is no menu bar icon or notification showing recording status. Use `get_status` tool or check logs.
+- **Google Meet requires Automation permission.** macOS will ask once to allow controlling Chrome/Safari. Needed for tab URL detection.
 
 <details>
 <summary><strong>Troubleshooting</strong></summary>
