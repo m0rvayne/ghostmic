@@ -21,6 +21,9 @@ dependencies = [
 [project.optional-dependencies]
 test = ["pytest", "pytest-asyncio"]
 
+[project.scripts]
+meeting-transcript-mcp = "server:main"
+
 [project.urls]
 Repository = "https://github.com/m0rvayne/meeting-transcript-mcp"
 

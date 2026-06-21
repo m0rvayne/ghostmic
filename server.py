@@ -491,11 +491,16 @@ async def call_tool(name: str, arguments: dict | None):
     return [types.TextContent(type="text", text=f"Unknown tool: {name}")]
 
 
-async def main():
+async def _async_main():
     async with stdio_server() as (read_stream, write_stream):
         await server.run(read_stream, write_stream, server.create_initialization_options())
 
 
-if __name__ == "__main__":
+def main():
+    """Entry point for console_scripts and direct execution."""
     import asyncio
-    asyncio.run(main())
+    asyncio.run(_async_main())
+
+
+if __name__ == "__main__":
+    main()
