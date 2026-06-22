@@ -92,6 +92,28 @@ func createMultiOutputDevice(name: String, subDeviceUIDs: [String]) -> Bool {
     }
 }
 
+// MARK: - Default output device
+
+func getDefaultOutputDevice() -> AudioDevice? {
+    var address = AudioObjectPropertyAddress(
+        mSelector: kAudioHardwarePropertyDefaultOutputDevice,
+        mScope: kAudioObjectPropertyScopeGlobal,
+        mElement: kAudioObjectPropertyElementMain
+    )
+    var deviceID: AudioDeviceID = 0
+    var size = UInt32(MemoryLayout<AudioDeviceID>.size)
+    let status = AudioObjectGetPropertyData(
+        AudioObjectID(kAudioObjectSystemObject), &address, 0, nil, &size, &deviceID
+    )
+    guard status == noErr, deviceID != 0 else { return nil }
+
+    guard let uid = getStringProperty(deviceID, kAudioDevicePropertyDeviceUID),
+          let name = getStringProperty(deviceID, kAudioObjectPropertyName) else { return nil }
+    let outputChannels = getChannelCount(deviceID, scope: kAudioDevicePropertyScopeOutput)
+    let transport = getUInt32Property(deviceID, kAudioDevicePropertyTransportType) ?? 0
+    return AudioDevice(id: deviceID, uid: uid, name: name, isOutput: outputChannels > 0, transportType: transport)
+}
+
 // MARK: - JSON output
 
 func devicesJSON(_ devices: [AudioDevice]) -> String {
@@ -120,6 +142,14 @@ case "list":
         for d in devices where d.isOutput {
             print("[\(d.id)] \(d.name) (uid: \(d.uid), transport: \(d.transportType))")
         }
+    }
+
+case "default-output":
+    if let dev = getDefaultOutputDevice() {
+        print("\(dev.uid) \(dev.name)")
+    } else {
+        fputs("No default output device found\n", stderr)
+        exit(1)
     }
 
 case "create":

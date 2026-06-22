@@ -66,15 +66,19 @@ fi
 [[ -z "$BH_UID" ]] && { err "BlackHole not detected. Reboot and try again."; exit 1; }
 ok "BlackHole 2ch (UID: $BH_UID)"
 
-# ── 3. Find speakers/headphones (not BlackHole, not aggregate) ───────────────
-say "Finding output device..."
-# transportType 1735554416 = 'aggr' (aggregate device)
-read -r SPEAKER_UID SPEAKER_NAME <<< $(echo "$DEVICES_JSON" | python3 -c "
+# ── 3. Find the CURRENT default output device ────────────────────────────────
+say "Finding current output device..."
+read -r SPEAKER_UID SPEAKER_NAME <<< $("$CLI_BIN" default-output 2>/dev/null || echo "")
+
+# If default output is BlackHole or an aggregate, fall back to finding a real device
+if [[ -z "$SPEAKER_UID" ]] || echo "$SPEAKER_UID" | grep -qi "blackhole"; then
+    read -r SPEAKER_UID SPEAKER_NAME <<< $(echo "$DEVICES_JSON" | python3 -c "
 import json, sys
 for d in json.load(sys.stdin):
     if d.get('isOutput') and 'blackhole' not in d['name'].lower() and d.get('transportType') != 1735554416:
         print(d['uid'], d['name']); break
 " 2>/dev/null || echo "")
+fi
 
 [[ -z "$SPEAKER_UID" ]] && { err "No output device found."; exit 1; }
 ok "Output: $SPEAKER_NAME"
