@@ -271,6 +271,12 @@ else
 fi
 
 # ── Done ─────────────────────────────────────────────────────────────────────
+# ── 12. Auto-configure Claude Code MCP (if claude CLI available) ──────────
+if command -v claude &>/dev/null; then
+    say "Configuring Claude Code MCP..."
+    claude mcp add meeting-transcript "$VENV_PY" "$INSTALL_DIR/server.py" 2>/dev/null && ok "Claude Code MCP configured" || warn "Claude Code MCP config skipped — configure manually if needed"
+fi
+
 cat << SUMMARY
 
   ╔═══════════════════════════════════════════════════╗
@@ -279,29 +285,22 @@ cat << SUMMARY
 
   Location: $INSTALL_DIR
 
-  ┌──────────────────────────────────────────────────────────┐
-  │  ONE STEP — In Zoom:                                      │
-  │                                                            │
-  │  Settings → Audio → Speaker → "Zoom + Transcript"          │
-  │                                                            │
-  │  Full quality audio (48kHz stereo) to your speakers        │
-  │  + BlackHole capture for Whisper transcription.             │
-  │                                                            │
-  │  💡 Switched headphones? Run:                               │
-  │     bash $INSTALL_DIR/setup-audio.sh                       │
-  └──────────────────────────────────────────────────────────┘
+  LAST STEP — In Zoom (one-time):
+  Settings → Audio → Speaker → "Zoom + Transcript"
 
-  Watcher is running as a LaunchAgent — it auto-starts on login
-  and auto-detects Zoom meetings. No manual launch needed.
+  Everything else is automatic:
+  - Watcher daemon detects Zoom meetings and starts recording
+  - Menu bar shows 🔴 when recording
+  - Claude Desktop + Claude Code are configured
 
-  Transcripts saved to: $INSTALL_DIR/transcripts/
+  Restart Claude Desktop: Cmd+Q → reopen
 
-  In Claude Desktop (after Cmd+Q → reopen):
-    "what are they talking about?" — live transcript
-    "summarize the last 10 minutes" — filtered recap
+  Then just ask Claude:
+    "what are they talking about?"
+    "summarize the last 10 minutes"
+    "make meeting notes"
 
-  Diagnostics:
-    launchctl list | grep meeting-transcript
-    tail -20 $INSTALL_DIR/watcher.log
+  Transcripts: $INSTALL_DIR/transcripts/
+  Logs: tail -20 $INSTALL_DIR/watcher.log
 
 SUMMARY
