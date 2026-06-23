@@ -1,9 +1,71 @@
-// Meeting Transcript MCP — Premium Menu Bar
+// ghostmic — Premium Menu Bar
 // Real NSButton/NSTextField/NSStackView with settings panel
 // Compile: swiftc -O -framework AppKit statusbar.swift -o statusbar
 
 import AppKit
 import Foundation
+
+
+// MARK: - Ghost Icon Generator
+
+func ghostIcon(filled: Bool, recording: Bool, size: CGFloat = 18) -> NSImage {
+    let img = NSImage(size: NSSize(width: size, height: size))
+    img.lockFocus()
+
+    let scale = size / 16.0
+
+    // Ghost body path (from SVG)
+    let body = NSBezierPath()
+    body.move(to: NSPoint(x: 8 * scale, y: (16 - 1) * scale))
+    body.curve(to: NSPoint(x: 2 * scale, y: (16 - 6.5) * scale),
+               controlPoint1: NSPoint(x: 4.5 * scale, y: (16 - 1) * scale),
+               controlPoint2: NSPoint(x: 2 * scale, y: (16 - 3.5) * scale))
+    body.line(to: NSPoint(x: 2 * scale, y: (16 - 13) * scale))
+    body.line(to: NSPoint(x: 4 * scale, y: (16 - 11.5) * scale))
+    body.line(to: NSPoint(x: 6 * scale, y: (16 - 13) * scale))
+    body.line(to: NSPoint(x: 8 * scale, y: (16 - 11.5) * scale))
+    body.line(to: NSPoint(x: 10 * scale, y: (16 - 13) * scale))
+    body.line(to: NSPoint(x: 12 * scale, y: (16 - 11.5) * scale))
+    body.line(to: NSPoint(x: 14 * scale, y: (16 - 13) * scale))
+    body.line(to: NSPoint(x: 14 * scale, y: (16 - 6.5) * scale))
+    body.curve(to: NSPoint(x: 8 * scale, y: (16 - 1) * scale),
+               controlPoint1: NSPoint(x: 14 * scale, y: (16 - 3.5) * scale),
+               controlPoint2: NSPoint(x: 11.5 * scale, y: (16 - 1) * scale))
+    body.close()
+
+    if filled {
+        NSColor.black.setFill()
+        body.fill()
+        // White eyes
+        NSColor.white.setFill()
+        let leftEye = NSBezierPath(ovalIn: NSRect(x: (6 - 1.3) * scale, y: (16 - 6 - 1.3) * scale, width: 2.6 * scale, height: 2.6 * scale))
+        let rightEye = NSBezierPath(ovalIn: NSRect(x: (10 - 1.3) * scale, y: (16 - 6 - 1.3) * scale, width: 2.6 * scale, height: 2.6 * scale))
+        leftEye.fill()
+        rightEye.fill()
+    } else {
+        // Outline only (idle)
+        NSColor.black.setStroke()
+        body.lineWidth = 1.2 * scale
+        body.stroke()
+        // Black dot eyes
+        NSColor.black.setFill()
+        let leftEye = NSBezierPath(ovalIn: NSRect(x: (6 - 1.3) * scale, y: (16 - 6 - 1.3) * scale, width: 2.6 * scale, height: 2.6 * scale))
+        let rightEye = NSBezierPath(ovalIn: NSRect(x: (10 - 1.3) * scale, y: (16 - 6 - 1.3) * scale, width: 2.6 * scale, height: 2.6 * scale))
+        leftEye.fill()
+        rightEye.fill()
+    }
+
+    // Red recording dot (top-right)
+    if recording {
+        NSColor(red: 1.0, green: 0.23, blue: 0.19, alpha: 1.0).setFill()
+        let dot = NSBezierPath(ovalIn: NSRect(x: (13.5 - 2) * scale, y: (16 - 2.5 - 2) * scale, width: 4 * scale, height: 4 * scale))
+        dot.fill()
+    }
+
+    img.unlockFocus()
+    img.isTemplate = !recording  // template = macOS auto-colors for light/dark. Recording has red dot so not template.
+    return img
+}
 
 // MARK: - Theme
 
@@ -225,7 +287,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         config = AppConfig.load(home: homePath)
 
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
-        statusItem.button?.title = "🎙️"
+        statusItem.button?.image = ghostIcon(filled: false, recording: false)
+        statusItem.button?.title = ""
 
         menu = NSMenu()
         menu.appearance = NSAppearance(named: .darkAqua)
@@ -475,7 +538,15 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     func setState(_ state: String, transcript: String, start: TimeInterval) {
         currentState = state; transcriptName = transcript; recordingStart = start
         let active = (state == "RECORDING" || state == "PAUSED")
-        statusItem.button?.title = state == "RECORDING" ? "🔴" : state == "PAUSED" ? "⏸️" : "🎙️"
+        statusItem.button?.title = ""
+        switch state {
+        case "RECORDING":
+            statusItem.button?.image = ghostIcon(filled: true, recording: true)
+        case "PAUSED":
+            statusItem.button?.image = ghostIcon(filled: true, recording: false)
+        default:
+            statusItem.button?.image = ghostIcon(filled: false, recording: false)
+        }
         buttonsRow.isHidden = !active
         if state == "RECORDING" {
             statusDot.layer?.backgroundColor = kGreen.cgColor
