@@ -538,15 +538,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     func setState(_ state: String, transcript: String, start: TimeInterval) {
         currentState = state; transcriptName = transcript; recordingStart = start
         let active = (state == "RECORDING" || state == "PAUSED")
-        statusItem.button?.title = ""
-        switch state {
-        case "RECORDING":
-            statusItem.button?.image = ghostIcon(filled: true, recording: true)
-        case "PAUSED":
-            statusItem.button?.image = ghostIcon(filled: true, recording: false)
-        default:
-            statusItem.button?.image = ghostIcon(filled: false, recording: false)
-        }
+        // Ghost icon stays the same — always the outline ghost
+        // State is shown inside the menu, not in the icon
         buttonsRow.isHidden = !active
         if state == "RECORDING" {
             statusDot.layer?.backgroundColor = kGreen.cgColor
