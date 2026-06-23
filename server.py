@@ -15,8 +15,10 @@ from mcp import types
 
 INSTALL_DIR = Path(__file__).parent
 PID_FILE = INSTALL_DIR / "watcher.pid"
+_DEFAULT_TRANSCRIPTS = INSTALL_DIR / "transcripts"
 
-def _load_transcripts_dir() -> Path:
+
+def _get_transcripts_dir() -> Path:
     config_file = INSTALL_DIR / "config.json"
     if config_file.exists():
         try:
@@ -27,9 +29,15 @@ def _load_transcripts_dir() -> Path:
                 return Path(p)
         except Exception:
             pass
-    return INSTALL_DIR / "transcripts"
+    return _DEFAULT_TRANSCRIPTS
 
-TRANSCRIPTS_DIR = _load_transcripts_dir()
+
+def _get_current() -> Path:
+    return _get_transcripts_dir() / "meeting_transcript.txt"
+
+
+# Keep module-level references for backward compat with tests
+TRANSCRIPTS_DIR = _DEFAULT_TRANSCRIPTS
 CURRENT = TRANSCRIPTS_DIR / "meeting_transcript.txt"
 FRESHNESS_THRESHOLD = 180  # seconds
 MAX_TRANSCRIPT_BYTES = 50 * 1024 * 1024  # 50 MB
@@ -42,10 +50,12 @@ server = Server("meeting-transcript")
 def _resolve_transcript() -> Path | None:
     """Resolve the current transcript symlink, with boundary check."""
     try:
-        target = CURRENT.resolve() if CURRENT.is_symlink() else CURRENT
+        current = _get_current()
+        tdir = _get_transcripts_dir()
+        target = current.resolve() if current.is_symlink() else current
         if not target.exists():
             return None
-        if not target.is_relative_to(TRANSCRIPTS_DIR.resolve()):
+        if not target.is_relative_to(tdir.resolve()):
             return None
         return target
     except Exception:
@@ -75,17 +85,18 @@ def _freshness_note() -> str:
 
 
 def _safe_transcript_path(filename: str) -> Path | None:
-    """Resolve filename and ensure it stays within TRANSCRIPTS_DIR. Rejects symlinks."""
+    """Resolve filename and ensure it stays within transcripts dir. Rejects symlinks."""
     try:
         if not filename or "/" in filename or "\\" in filename or ".." in filename:
             return None
         if "%" in filename or "\x00" in filename:
             return None
-        candidate = TRANSCRIPTS_DIR / filename
+        tdir = _get_transcripts_dir()
+        candidate = tdir / filename
         if candidate.is_symlink():
             return None
         path = candidate.resolve()
-        if not path.is_relative_to(TRANSCRIPTS_DIR.resolve()):
+        if not path.is_relative_to(tdir.resolve()):
             return None
         if not path.exists():
             return None
@@ -157,9 +168,10 @@ async def list_resources():
             description="Live or most recent meeting transcript text",
             mimeType="text/plain",
         ))
-    if TRANSCRIPTS_DIR.exists():
+    tdir = _get_transcripts_dir()
+    if tdir.exists():
         count = 0
-        for f in sorted(TRANSCRIPTS_DIR.glob("*.txt"), reverse=True):
+        for f in sorted(tdir.glob("*.txt"), reverse=True):
             if f.name == "meeting_transcript.txt" or f.is_symlink():
                 continue
             resources.append(types.Resource(
@@ -404,9 +416,10 @@ async def call_tool(name: str, arguments: dict | None):
         return [types.TextContent(type="text", text=result)]
 
     elif name == "list_past_meetings":
-        if not TRANSCRIPTS_DIR.exists():
+        tdir = _get_transcripts_dir()
+        if not tdir.exists():
             return [types.TextContent(type="text", text="No recorded meetings.")]
-        files = sorted(TRANSCRIPTS_DIR.glob("*.txt"), reverse=True)
+        files = sorted(tdir.glob("*.txt"), reverse=True)
         files = [f for f in files if f.name != "meeting_transcript.txt" and not f.is_symlink()]
         if not files:
             return [types.TextContent(type="text", text="No recorded meetings.")]
@@ -427,11 +440,12 @@ async def call_tool(name: str, arguments: dict | None):
         query = arguments.get("query", "").strip()
         if not query:
             return [types.TextContent(type="text", text="Empty search query.")]
-        if not TRANSCRIPTS_DIR.exists():
+        tdir = _get_transcripts_dir()
+        if not tdir.exists():
             return [types.TextContent(type="text", text="No transcripts to search.")]
 
         results = []
-        files = sorted(TRANSCRIPTS_DIR.glob("*.txt"), reverse=True)
+        files = sorted(tdir.glob("*.txt"), reverse=True)
         files = [f for f in files if f.name != "meeting_transcript.txt" and not f.is_symlink()]
 
         for f in files[:MAX_PAST_MEETINGS]:
@@ -485,8 +499,9 @@ async def call_tool(name: str, arguments: dict | None):
         else:
             status_parts.append("Recording: inactive")
 
-        if TRANSCRIPTS_DIR.exists():
-            txt_files = [f for f in TRANSCRIPTS_DIR.glob("*.txt")
+        tdir = _get_transcripts_dir()
+        if tdir.exists():
+            txt_files = [f for f in tdir.glob("*.txt")
                          if f.name != "meeting_transcript.txt" and not f.is_symlink()]
             total_size = sum(f.stat().st_size for f in txt_files)
             status_parts.append(f"Transcripts: {len(txt_files)} meetings ({total_size // 1024 // 1024} MB)")
@@ -494,7 +509,7 @@ async def call_tool(name: str, arguments: dict | None):
             status_parts.append("Transcripts: none")
 
         try:
-            usage = shutil.disk_usage(TRANSCRIPTS_DIR.parent)
+            usage = shutil.disk_usage(tdir.parent)
             free_gb = usage.free / (1024 ** 3)
             status_parts.append(f"Disk free: {free_gb:.1f} GB")
         except Exception:

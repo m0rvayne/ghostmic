@@ -21,7 +21,9 @@ def setup_dirs(tmp_path):
         "server",
         TRANSCRIPTS_DIR=_transcripts,
         CURRENT=_transcripts / "meeting_transcript.txt",
-    ):
+        _DEFAULT_TRANSCRIPTS=_transcripts,
+    ), patch("server._get_transcripts_dir", return_value=_transcripts), \
+       patch("server._get_current", return_value=_transcripts / "meeting_transcript.txt"):
         yield
 
 
