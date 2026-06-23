@@ -27,7 +27,7 @@ struct AppConfig {
     static let models = ["tiny", "base", "small", "medium", "large-v3"]
 
     static func load(home: String) -> AppConfig {
-        let dir = home + "/.meeting-transcript-mcp"
+        let dir = home + "/.ghostmic"
         // Read current env config from watcher-status or defaults
         var cfg = AppConfig(transcriptsPath: dir + "/transcripts")
         if let data = try? Data(contentsOf: URL(fileURLWithPath: dir + "/config.json")),
@@ -40,7 +40,7 @@ struct AppConfig {
     }
 
     func save(home: String) {
-        let dir = home + "/.meeting-transcript-mcp"
+        let dir = home + "/.ghostmic"
         let json: [String: Any] = [
             "whisper_model": whisperModel,
             "diarization": diarization ? "1" : "0",
@@ -217,9 +217,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     var config: AppConfig!
 
     let homePath = NSHomeDirectory()
-    var statusPath: String { homePath + "/.meeting-transcript-mcp/watcher-status.json" }
-    var controlPath: String { homePath + "/.meeting-transcript-mcp/watcher-control.json" }
-    var transcriptsDir: String { config?.transcriptsPath ?? homePath + "/.meeting-transcript-mcp/transcripts" }
+    var statusPath: String { homePath + "/.ghostmic/watcher-status.json" }
+    var controlPath: String { homePath + "/.ghostmic/watcher-control.json" }
+    var transcriptsDir: String { config?.transcriptsPath ?? homePath + "/.ghostmic/transcripts" }
 
     func applicationDidFinishLaunching(_ n: Notification) {
         config = AppConfig.load(home: homePath)

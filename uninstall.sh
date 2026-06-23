@@ -2,12 +2,12 @@
 set -euo pipefail
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# Meeting Transcript MCP — Uninstaller
+# ghostmic — Uninstaller
 # ═══════════════════════════════════════════════════════════════════════════════
 
-INSTALL_DIR="$HOME/.meeting-transcript-mcp"
+INSTALL_DIR="$HOME/.ghostmic"
 CLAUDE_CONFIG="$HOME/Library/Application Support/Claude/claude_desktop_config.json"
-LAUNCH_LABEL="com.meeting-transcript.watcher"
+LAUNCH_LABEL="com.ghostmic.watcher"
 PLIST_PATH="$HOME/Library/LaunchAgents/$LAUNCH_LABEL.plist"
 
 RED='\033[0;31m'; GREEN='\033[0;32m'; CYAN='\033[0;36m'; NC='\033[0m'
@@ -17,7 +17,7 @@ ok()   { printf "${GREEN}  ✅ %s${NC}\n" "$*"; }
 cat << 'BANNER'
 
   ╔═══════════════════════════════════════════════════╗
-  ║   Meeting Transcript MCP — Uninstaller             ║
+  ║   ghostmic — Uninstaller             ║
   ╚═══════════════════════════════════════════════════╝
 
 BANNER
@@ -25,9 +25,9 @@ BANNER
 # 1. Stop and remove LaunchAgent
 say "Stopping watcher daemon and menu bar indicator..."
 launchctl bootout "gui/$(id -u)/$LAUNCH_LABEL" 2>/dev/null || true
-launchctl bootout "gui/$(id -u)/com.meeting-transcript.statusbar" 2>/dev/null || true
+launchctl bootout "gui/$(id -u)/com.ghostmic.statusbar" 2>/dev/null || true
 [[ -f "$PLIST_PATH" ]] && rm "$PLIST_PATH"
-[[ -f "$HOME/Library/LaunchAgents/com.meeting-transcript.statusbar.plist" ]] && rm "$HOME/Library/LaunchAgents/com.meeting-transcript.statusbar.plist"
+[[ -f "$HOME/Library/LaunchAgents/com.ghostmic.statusbar.plist" ]] && rm "$HOME/Library/LaunchAgents/com.ghostmic.statusbar.plist"
 ok "LaunchAgents removed"
 
 # 2. Remove MCP entry from Claude Desktop config
@@ -39,12 +39,12 @@ if [[ -f "$CLAUDE_CONFIG" ]]; then
 import json, sys
 try:
     with open('$CLAUDE_CONFIG') as f: config = json.load(f)
-    if 'mcpServers' in config and 'meeting-transcript' in config['mcpServers']:
-        del config['mcpServers']['meeting-transcript']
+    if 'mcpServers' in config and 'ghostmic' in config['mcpServers']:
+        del config['mcpServers']['ghostmic']
         with open('$CLAUDE_CONFIG', 'w') as f: json.dump(config, f, indent=2)
-        print('  Removed meeting-transcript from Claude Desktop config')
+        print('  Removed ghostmic from Claude Desktop config')
     else:
-        print('  No meeting-transcript entry found in config')
+        print('  No ghostmic entry found in config')
 except Exception as e:
     print(f'  Could not update config: {e}', file=sys.stderr)
 " 2>&1
@@ -64,7 +64,7 @@ if [[ -d "$INSTALL_DIR/transcripts" ]]; then
             ok "Transcripts deleted"
         else
             # Move transcripts out before deleting install dir
-            SAVED="$HOME/Desktop/meeting-transcripts-backup"
+            SAVED="$HOME/Desktop/ghostmics-backup"
             mv "$INSTALL_DIR/transcripts" "$SAVED"
             ok "Transcripts saved to $SAVED"
         fi

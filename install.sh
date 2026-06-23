@@ -2,14 +2,14 @@
 set -euo pipefail
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# Meeting Transcript MCP — One-command installer
+# ghostmic — One-command installer
 # Live Zoom transcription: BlackHole -> Whisper AI -> text
 # Audio passthrough: hear Zoom through speakers/headphones, auto headphone switch
 # ═══════════════════════════════════════════════════════════════════════════════
 
-INSTALL_DIR="$HOME/.meeting-transcript-mcp"
+INSTALL_DIR="$HOME/.ghostmic"
 CLAUDE_CONFIG="$HOME/Library/Application Support/Claude/claude_desktop_config.json"
-LAUNCH_LABEL="com.meeting-transcript.watcher"
+LAUNCH_LABEL="com.ghostmic.watcher"
 
 GREEN='\033[0;32m'; YELLOW='\033[1;33m'; RED='\033[0;31m'; CYAN='\033[0;36m'; NC='\033[0m'
 say()  { printf "${CYAN}[installer]${NC} %s\n" "$*"; }
@@ -20,7 +20,7 @@ err()  { printf "${RED}  ❌ %s${NC}\n" "$*"; }
 cat << 'BANNER'
 
   ╔═══════════════════════════════════════════════════╗
-  ║   🎙️ Meeting Transcript MCP — Installer           ║
+  ║   🎙️ ghostmic — Installer           ║
   ║   Live Zoom → Whisper AI → text transcription     ║
   ╚═══════════════════════════════════════════════════╝
 
@@ -31,13 +31,13 @@ BANNER
 # ── 0. Self-bootstrap: if run via curl|bash, clone repo first ────────────────
 if [[ "${BASH_SOURCE[0]}" == "" ]] || [[ ! -f "$(dirname "${BASH_SOURCE[0]}")/capture.py" ]]; then
     say "Downloading repository..."
-    REPO_DIR="/tmp/meeting-transcript-mcp-$$"
+    REPO_DIR="/tmp/ghostmic-$$"
     trap 'rm -rf "$REPO_DIR" 2>/dev/null' EXIT
     if command -v git &>/dev/null; then
-        git clone --depth 1 https://github.com/m0rvayne/meeting-transcript-mcp.git "$REPO_DIR" 2>&1 | tail -1
+        git clone --depth 1 https://github.com/m0rvayne/ghostmic.git "$REPO_DIR" 2>&1 | tail -1
     else
         mkdir -p "$REPO_DIR"
-        curl -fsSL https://github.com/m0rvayne/meeting-transcript-mcp/archive/refs/heads/main.tar.gz \
+        curl -fsSL https://github.com/m0rvayne/ghostmic/archive/refs/heads/main.tar.gz \
             | tar -xz -C "$REPO_DIR" --strip-components=1
     fi
     # Verify download integrity
@@ -236,7 +236,7 @@ ok "Watcher auto-start configured (survives reboot)"
 
 # ── 11. Menu bar indicator ──────────────────────────────────────────────────
 say "Building menu bar indicator..."
-STATUSBAR_LABEL="com.meeting-transcript.statusbar"
+STATUSBAR_LABEL="com.ghostmic.statusbar"
 STATUSBAR_BIN="$INSTALL_DIR/.build/statusbar"
 if command -v swiftc &>/dev/null; then
     mkdir -p "$INSTALL_DIR/.build"
@@ -280,7 +280,7 @@ fi
 cat << SUMMARY
 
   ╔═══════════════════════════════════════════════════╗
-  ║         ✅ Meeting Transcript Installed!            ║
+  ║         ✅ ghostmic Installed!            ║
   ╚═══════════════════════════════════════════════════╝
 
   Location: $INSTALL_DIR

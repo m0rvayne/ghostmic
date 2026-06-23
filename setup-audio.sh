@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# Meeting Transcript — Auto Audio Setup
+# ghostmic — Auto Audio Setup
 # Creates Multi-Output Device (Speakers + BlackHole) automatically
 # Uses a compiled Swift CLI — no Node.js required
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -20,7 +20,7 @@ err()  { printf "${RED}  ❌ %s${NC}\n" "$*"; }
 cat << 'BANNER'
 
   ╔═══════════════════════════════════════════════════╗
-  ║   Meeting Transcript — Auto Audio Setup            ║
+  ║   ghostmic — Auto Audio Setup            ║
   ╚═══════════════════════════════════════════════════╝
 
 BANNER

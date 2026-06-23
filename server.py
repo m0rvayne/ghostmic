@@ -44,7 +44,7 @@ MAX_TRANSCRIPT_BYTES = 50 * 1024 * 1024  # 50 MB
 MAX_PAST_MEETINGS = 200
 MAX_SEARCH_RESULTS = 20
 
-server = Server("meeting-transcript")
+server = Server("ghostmic")
 
 
 def _resolve_transcript() -> Path | None:

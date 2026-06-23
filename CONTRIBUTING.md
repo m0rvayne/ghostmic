@@ -5,8 +5,8 @@ Thanks for wanting to help.
 ## Setup
 
 ```bash
-git clone https://github.com/m0rvayne/meeting-transcript-mcp.git
-cd meeting-transcript-mcp
+git clone https://github.com/m0rvayne/ghostmic.git
+cd ghostmic
 python3 -m venv .test-venv
 .test-venv/bin/pip install -e ".[test]"
 .test-venv/bin/pytest -v

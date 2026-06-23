@@ -12,8 +12,8 @@ ok()   { printf "${GREEN}  ✅ %s${NC}\n" "$*"; }
 warn() { printf "${YELLOW}  ⚠️  %s${NC}\n" "$*"; }
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-INSTALL_DIR="$HOME/.meeting-transcript-mcp"
-LAUNCH_LABEL="com.meeting-transcript.watcher"
+INSTALL_DIR="$HOME/.ghostmic"
+LAUNCH_LABEL="com.ghostmic.watcher"
 
 if [[ ! -d "$INSTALL_DIR" ]]; then
     echo "❌ Install dir not found: $INSTALL_DIR"
@@ -71,7 +71,7 @@ else
     fi
 
     # Restart menu bar indicator
-    STATUSBAR_LABEL="com.meeting-transcript.statusbar"
+    STATUSBAR_LABEL="com.ghostmic.statusbar"
     if launchctl kickstart -k "gui/$(id -u)/$STATUSBAR_LABEL" 2>/dev/null; then
         ok "Menu bar restarted"
     else
