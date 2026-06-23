@@ -176,11 +176,11 @@ except (json.JSONDecodeError, ValueError):
     config = {}
 
 config.setdefault("mcpServers", {})
-config["mcpServers"]["meeting-transcript"] = {
+config["mcpServers"]["ghostmic"] = {
     "command": venv_py,
     "args": [server_py]
 }
-print(f"  Set: meeting-transcript -> {server_py}")
+print(f"  Set: ghostmic -> {server_py}")
 
 with open(config_path, "w") as f:
     json.dump(config, f, indent=2)
@@ -189,7 +189,7 @@ else
     mkdir -p "$(dirname "$CLAUDE_CONFIG")"
     "$INSTALL_DIR/.venv/bin/python3" -c "
 import json
-config = {'mcpServers': {'meeting-transcript': {'command': '$VENV_PY', 'args': ['$INSTALL_DIR/server.py']}}}
+config = {'mcpServers': {'ghostmic': {'command': '$VENV_PY', 'args': ['$INSTALL_DIR/server.py']}}}
 with open('$CLAUDE_CONFIG', 'w') as f: json.dump(config, f, indent=2)
 "
 fi
@@ -274,7 +274,7 @@ fi
 # ── 12. Auto-configure Claude Code MCP (if claude CLI available) ──────────
 if command -v claude &>/dev/null; then
     say "Configuring Claude Code MCP..."
-    claude mcp add meeting-transcript "$VENV_PY" "$INSTALL_DIR/server.py" 2>/dev/null && ok "Claude Code MCP configured" || warn "Claude Code MCP config skipped — configure manually if needed"
+    claude mcp add ghostmic "$VENV_PY" "$INSTALL_DIR/server.py" 2>/dev/null && ok "Claude Code MCP configured" || warn "Claude Code MCP config skipped — configure manually if needed"
 fi
 
 cat << SUMMARY
