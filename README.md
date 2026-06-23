@@ -2,9 +2,9 @@
 
 <img src="assets/logo.svg" alt="ghostmic" width="100%">
 
-**No bot joins the call.**
+**Your meetings, transcribed invisibly. No bot. No cloud. No one knows.**
 
-Silent meeting transcription for Claude. Local Whisper AI, no cloud, no one knows you're recording.
+Give Claude live context from your Zoom calls — Whisper AI runs locally, audio never leaves your Mac, and nothing shows up in the participant list.
 
 [![Tests](https://github.com/m0rvayne/ghostmic/actions/workflows/test.yml/badge.svg)](https://github.com/m0rvayne/ghostmic/actions)
 [![macOS 12+](https://img.shields.io/badge/platform-macOS_12%2B-blue)](https://github.com/m0rvayne/ghostmic)
