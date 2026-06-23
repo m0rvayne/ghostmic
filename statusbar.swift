@@ -264,6 +264,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     var timerRow = NSStackView()
     var gotoBtn = LinkButton()
     var gotoButton = HoverButton()
+    var sep1Item = NSMenuItem()
+    var sep2Item = NSMenuItem()
+    var btnMenuItem = NSMenuItem()
+    var statusMenuItem = NSMenuItem()
 
     // Settings items (hidden by default)
     var settingsItems: [NSMenuItem] = []
@@ -314,22 +318,23 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         headerItem.view = makeHeader()
         menu.addItem(headerItem)
 
-        let s1 = NSMenuItem(); s1.view = padded(sep(), h: 0, v: 4); menu.addItem(s1)
+        sep1Item = NSMenuItem(); sep1Item.view = padded(sep(), h: 0, v: 4); menu.addItem(sep1Item)
 
         // Buttons
-        let btnItem = NSMenuItem()
+        btnMenuItem = NSMenuItem()
         stopBtn = HoverButton.make(title: "STOP", color: kStopRed, target: self, action: #selector(doStop))
         pauseBtn = HoverButton.make(title: "PAUSE", color: kPauseYellow, target: self, action: #selector(doPause))
         restartBtn = HoverButton.make(title: "RESTART", color: kGreen, target: self, action: #selector(doRestart))
         buttonsRow = NSStackView(views: [stopBtn, pauseBtn, restartBtn])
         buttonsRow.distribution = .fillEqually; buttonsRow.spacing = 6
-        btnItem.view = padded(buttonsRow, h: 14, v: 6)
-        menu.addItem(btnItem)
+        btnMenuItem.view = padded(buttonsRow, h: 14, v: 6)
+        menu.addItem(btnMenuItem)
 
-        let s2 = NSMenuItem(); s2.view = padded(sep(), h: 14, v: 4); menu.addItem(s2)
+        sep2Item = NSMenuItem(); sep2Item.view = padded(sep(), h: 14, v: 4); menu.addItem(sep2Item)
 
         // Status + Timer on one line
-        let si = NSMenuItem()
+        statusMenuItem = NSMenuItem()
+        let si = statusMenuItem
         statusDot = dot(color: kGreen)
         statusLabel = lbl("No active recording", size: 12, weight: .medium, color: kDimText)
         timerLabel = lbl("", size: 12, weight: .regular, color: kDimText)
@@ -552,8 +557,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         let active = (state == "RECORDING" || state == "PAUSED")
         // Ghost icon stays the same — always the outline ghost
         // State is shown inside the menu, not in the icon
-        buttonsRow.isHidden = !active
-        statusRow.isHidden = !active
+        sep1Item.isHidden = !active
+        btnMenuItem.isHidden = !active
+        sep2Item.isHidden = !active
+        statusMenuItem.isHidden = !active
         if state == "RECORDING" {
             statusDot.layer?.backgroundColor = kGreen.cgColor
             statusLabel.stringValue = "Transcript active"; statusLabel.textColor = .white.withAlphaComponent(0.9)
