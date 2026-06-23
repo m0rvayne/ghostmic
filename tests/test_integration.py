@@ -61,27 +61,27 @@ class TestMCPIntegration:
         async def check(session):
             tools = await session.list_tools()
             names = {t.name for t in tools.tools}
-            assert "read_meeting_transcript" in names
-            assert "search_transcripts" in names
-            assert "get_status" in names
+            assert "get_live_transcript" in names
+            assert "search_meetings" in names
+            assert "ghostmic_status" in names
             assert len(tools.tools) == 5
         _sync_run(check)
 
-    def test_get_status(self):
+    def test_ghostmic_status(self):
         async def check(session):
-            result = await session.call_tool("get_status")
+            result = await session.call_tool("ghostmic_status")
             assert not result.isError
             text = result.content[0].text
             assert "Watcher:" in text
             assert "Recording:" in text
         _sync_run(check)
 
-    def test_read_past_meeting(self):
+    def test_read_meeting(self):
         f = _write_transcript("_test_integ_read.txt",
                               "[00:00:05-00:00:35] Hello from integration test.\n")
         try:
             async def check(session):
-                result = await session.call_tool("read_past_meeting",
+                result = await session.call_tool("read_meeting",
                                                  {"filename": "_test_integ_read.txt"})
                 assert not result.isError
                 assert "Hello from integration test" in result.content[0].text
@@ -91,18 +91,18 @@ class TestMCPIntegration:
 
     def test_path_traversal_blocked(self):
         async def check(session):
-            result = await session.call_tool("read_past_meeting",
+            result = await session.call_tool("read_meeting",
                                              {"filename": "../../server.py"})
             text = result.content[0].text.lower()
             assert "not found" in text or "invalid" in text
         _sync_run(check)
 
-    def test_search_transcripts(self):
+    def test_search_meetings(self):
         f = _write_transcript("_test_integ_search.txt",
                               "[00:00:10-00:00:40] We discussed the quarterly budget.\n")
         try:
             async def check(session):
-                result = await session.call_tool("search_transcripts", {"query": "budget"})
+                result = await session.call_tool("search_meetings", {"query": "budget"})
                 assert not result.isError
                 assert "budget" in result.content[0].text.lower()
             _sync_run(check)
@@ -113,7 +113,7 @@ class TestMCPIntegration:
         async def check(session):
             prompts = await session.list_prompts()
             names = {p.name for p in prompts.prompts}
-            assert "meeting-notes" in names
+            assert "meeting_notes" in names
         _sync_run(check)
 
     def test_meeting_notes_prompt_has_salted_tags(self):
@@ -121,7 +121,7 @@ class TestMCPIntegration:
                               "[00:00:05-00:00:35] Let's discuss the product roadmap.\n")
         try:
             async def check(session):
-                result = await session.get_prompt("meeting-notes",
+                result = await session.get_prompt("meeting_notes",
                                                   {"filename": "_test_integ_prompt.txt"})
                 text = result.messages[0].content.text
                 assert "roadmap" in text

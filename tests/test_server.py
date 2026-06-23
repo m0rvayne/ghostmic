@@ -64,32 +64,32 @@ class TestSafeTranscriptPath:
         f = _transcripts / "2026-01-01_10-00-00.txt"
         f.write_text("test")
         with patch("server.TRANSCRIPTS_DIR", _transcripts):
-            result = server._safe_transcript_path("2026-01-01_10-00-00.txt")
+            result = server._safe_path("2026-01-01_10-00-00.txt")
         assert result is not None
 
     def test_path_traversal_dotdot(self):
         with patch("server.TRANSCRIPTS_DIR", _transcripts):
-            assert server._safe_transcript_path("../../etc/passwd") is None
+            assert server._safe_path("../../etc/passwd") is None
 
     def test_path_traversal_slash(self):
         with patch("server.TRANSCRIPTS_DIR", _transcripts):
-            assert server._safe_transcript_path("/etc/passwd") is None
+            assert server._safe_path("/etc/passwd") is None
 
     def test_path_traversal_backslash(self):
         with patch("server.TRANSCRIPTS_DIR", _transcripts):
-            assert server._safe_transcript_path("..\\..\\etc\\passwd") is None
+            assert server._safe_path("..\\..\\etc\\passwd") is None
 
     def test_url_encoded_traversal(self):
         with patch("server.TRANSCRIPTS_DIR", _transcripts):
-            assert server._safe_transcript_path("..%2F..%2Fetc%2Fpasswd") is None
+            assert server._safe_path("..%2F..%2Fetc%2Fpasswd") is None
 
     def test_empty_filename(self):
         with patch("server.TRANSCRIPTS_DIR", _transcripts):
-            assert server._safe_transcript_path("") is None
+            assert server._safe_path("") is None
 
     def test_nonexistent_file(self):
         with patch("server.TRANSCRIPTS_DIR", _transcripts):
-            assert server._safe_transcript_path("nonexistent.txt") is None
+            assert server._safe_path("nonexistent.txt") is None
 
     def test_symlink_rejected(self):
         target = _transcripts / "real.txt"
@@ -97,7 +97,7 @@ class TestSafeTranscriptPath:
         link = _transcripts / "sneaky.txt"
         link.symlink_to(target)
         with patch("server.TRANSCRIPTS_DIR", _transcripts):
-            assert server._safe_transcript_path("sneaky.txt") is None
+            assert server._safe_path("sneaky.txt") is None
 
     def test_symlink_outside_rejected(self):
         outside = _tmpdir / "secret.txt"
@@ -105,7 +105,7 @@ class TestSafeTranscriptPath:
         link = _transcripts / "escape.txt"
         link.symlink_to(outside)
         with patch("server.TRANSCRIPTS_DIR", _transcripts):
-            assert server._safe_transcript_path("escape.txt") is None
+            assert server._safe_path("escape.txt") is None
 
 
 class TestResolveTranscript:
@@ -183,20 +183,20 @@ class TestReadTranscriptText:
     def test_reads_through_symlink(self, sample_transcript):
         with patch("server.CURRENT", _transcripts / "meeting_transcript.txt"), \
              patch("server.TRANSCRIPTS_DIR", _transcripts):
-            text = server.read_transcript_text()
+            text = server._read_current()
         assert "Hello everyone" in text
 
     def test_too_large_file(self, sample_transcript):
         with patch("server.CURRENT", _transcripts / "meeting_transcript.txt"), \
              patch("server.TRANSCRIPTS_DIR", _transcripts), \
              patch("server.MAX_TRANSCRIPT_BYTES", 10):
-            text = server.read_transcript_text()
+            text = server._read_current()
         assert "too large" in text.lower()
 
     def test_no_file(self):
         with patch("server.CURRENT", _transcripts / "meeting_transcript.txt"), \
              patch("server.TRANSCRIPTS_DIR", _transcripts):
-            text = server.read_transcript_text()
+            text = server._read_current()
         assert text == ""
 
 
@@ -206,12 +206,12 @@ class TestCallTool:
         assert "Unknown tool" in result[0].text
 
     def test_none_arguments(self):
-        result = _run(server.call_tool("list_past_meetings", None))
+        result = _run(server.call_tool("list_meetings", None))
         assert result is not None
 
-    def test_read_past_meeting_traversal(self):
+    def test_read_meeting_traversal(self):
         with patch("server.TRANSCRIPTS_DIR", _transcripts):
-            result = _run(server.call_tool("read_past_meeting", {"filename": "../../etc/passwd"}))
+            result = _run(server.call_tool("read_meeting", {"filename": "../../etc/passwd"}))
         assert "not found" in result[0].text.lower() or "invalid" in result[0].text.lower()
 
     def test_last_minutes_string_value(self):
@@ -219,19 +219,19 @@ class TestCallTool:
         f.write_text("[14:00:00-14:00:30] Test content\n")
         with patch("server.CURRENT", f), \
              patch("server.TRANSCRIPTS_DIR", _transcripts):
-            result = _run(server.call_tool("read_meeting_transcript", {"last_minutes": "not_a_number"}))
+            result = _run(server.call_tool("get_live_transcript", {"last_minutes": "not_a_number"}))
         assert "Test content" in result[0].text
 
 
 class TestListPastMeetings:
     def test_empty_dir(self):
         with patch("server.TRANSCRIPTS_DIR", _transcripts):
-            result = _run(server.call_tool("list_past_meetings", {}))
-        assert "No recorded" in result[0].text
+            result = _run(server.call_tool("list_meetings", {}))
+        assert "No meetings" in result[0].text
 
     def test_filters_symlinks(self, sample_transcript):
         with patch("server.TRANSCRIPTS_DIR", _transcripts):
-            result = _run(server.call_tool("list_past_meetings", {}))
+            result = _run(server.call_tool("list_meetings", {}))
         assert "2026-06-20_14-30-00.txt" in result[0].text
         assert result[0].text.count("2026-06-20_14-30-00.txt") == 1
 
@@ -240,7 +240,7 @@ class TestListPastMeetings:
             (_transcripts / f"meeting_{i:03d}.txt").write_text(f"content {i}")
         with patch("server.TRANSCRIPTS_DIR", _transcripts), \
              patch("server.MAX_PAST_MEETINGS", 3):
-            result = _run(server.call_tool("list_past_meetings", {}))
+            result = _run(server.call_tool("list_meetings", {}))
         lines = [l for l in result[0].text.split("\n") if l.strip().startswith("-")]
         assert len(lines) == 3
 
@@ -250,7 +250,7 @@ class TestSearchTranscripts:
         (_transcripts / "meeting_a.txt").write_text("[14:00:00-14:00:30] We discussed the budget for Q3\n")
         (_transcripts / "meeting_b.txt").write_text("[14:00:00-14:00:30] Sprint planning session\n")
         with patch("server.TRANSCRIPTS_DIR", _transcripts):
-            result = _run(server.call_tool("search_transcripts", {"query": "budget"}))
+            result = _run(server.call_tool("search_meetings", {"query": "budget"}))
         assert "budget" in result[0].text.lower()
         assert "meeting_a.txt" in result[0].text
         assert "meeting_b.txt" not in result[0].text
@@ -258,19 +258,19 @@ class TestSearchTranscripts:
     def test_case_insensitive(self):
         (_transcripts / "meeting.txt").write_text("[14:00:00-14:00:30] The API launch is scheduled\n")
         with patch("server.TRANSCRIPTS_DIR", _transcripts):
-            result = _run(server.call_tool("search_transcripts", {"query": "api"}))
+            result = _run(server.call_tool("search_meetings", {"query": "api"}))
         assert "API" in result[0].text
 
     def test_no_results(self):
         (_transcripts / "meeting.txt").write_text("[14:00:00-14:00:30] Nothing relevant here\n")
         with patch("server.TRANSCRIPTS_DIR", _transcripts):
-            result = _run(server.call_tool("search_transcripts", {"query": "xyznonexistent"}))
+            result = _run(server.call_tool("search_meetings", {"query": "xyznonexistent"}))
         assert "No matches" in result[0].text
 
     def test_empty_query(self):
         with patch("server.TRANSCRIPTS_DIR", _transcripts):
-            result = _run(server.call_tool("search_transcripts", {"query": ""}))
-        assert "Empty" in result[0].text
+            result = _run(server.call_tool("search_meetings", {"query": ""}))
+        assert "provide" in result[0].text.lower() or "search" in result[0].text
 
 
 class TestGetStatus:
@@ -278,11 +278,11 @@ class TestGetStatus:
         with patch("server.TRANSCRIPTS_DIR", _transcripts), \
              patch("server.PID_FILE", _tmpdir / "nonexistent.pid"), \
              patch("server.INSTALL_DIR", _tmpdir):
-            result = _run(server.call_tool("get_status", {}))
+            result = _run(server.call_tool("ghostmic_status", {}))
         text = result[0].text
         assert "Watcher:" in text
         assert "Recording:" in text
-        assert "Transcripts:" in text
+        assert "Saved meetings:" in text
 
     def test_shows_transcript_count(self):
         for i in range(5):
@@ -290,20 +290,20 @@ class TestGetStatus:
         with patch("server.TRANSCRIPTS_DIR", _transcripts), \
              patch("server.PID_FILE", _tmpdir / "nonexistent.pid"), \
              patch("server.INSTALL_DIR", _tmpdir):
-            result = _run(server.call_tool("get_status", {}))
-        assert "5 meetings" in result[0].text
+            result = _run(server.call_tool("ghostmic_status", {}))
+        assert "5 (" in result[0].text
 
 
 class TestMeetingNotesPrompt:
     def test_list_prompts(self):
         prompts = _run(server.list_prompts())
         assert len(prompts) == 1
-        assert prompts[0].name == "meeting-notes"
+        assert prompts[0].name == "meeting_notes"
 
     def test_get_prompt_with_current_transcript(self, sample_transcript):
         with patch("server.CURRENT", _transcripts / "meeting_transcript.txt"), \
              patch("server.TRANSCRIPTS_DIR", _transcripts):
-            result = _run(server.get_prompt("meeting-notes", {}))
+            result = _run(server.get_prompt("meeting_notes", {}))
         assert len(result.messages) == 1
         text = result.messages[0].content.text
         assert "Topics Discussed" in text
@@ -312,7 +312,7 @@ class TestMeetingNotesPrompt:
 
     def test_get_prompt_with_past_meeting(self, sample_transcript):
         with patch("server.TRANSCRIPTS_DIR", _transcripts):
-            result = _run(server.get_prompt("meeting-notes", {"filename": "2026-06-20_14-30-00.txt"}))
+            result = _run(server.get_prompt("meeting_notes", {"filename": "2026-06-20_14-30-00.txt"}))
         text = result.messages[0].content.text
         assert "roadmap" in text
 
@@ -320,7 +320,7 @@ class TestMeetingNotesPrompt:
         with patch("server.CURRENT", _transcripts / "meeting_transcript.txt"), \
              patch("server.TRANSCRIPTS_DIR", _transcripts):
             with pytest.raises(ValueError, match="No transcript"):
-                _run(server.get_prompt("meeting-notes", {}))
+                _run(server.get_prompt("meeting_notes", {}))
 
     def test_get_prompt_unknown_name(self):
         with pytest.raises(ValueError, match="Unknown prompt"):
@@ -329,4 +329,4 @@ class TestMeetingNotesPrompt:
     def test_get_prompt_invalid_filename(self):
         with patch("server.TRANSCRIPTS_DIR", _transcripts):
             with pytest.raises(ValueError, match="not found"):
-                _run(server.get_prompt("meeting-notes", {"filename": "../../etc/passwd"}))
+                _run(server.get_prompt("meeting_notes", {"filename": "../../etc/passwd"}))
