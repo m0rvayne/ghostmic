@@ -1,6 +1,6 @@
 <div align="center">
 
-<img src="assets/logo.svg" alt="ghostmic" width="700">
+<img src="assets/logo.svg" alt="ghostmic" width="100%">
 
 **No bot joins the call.**
 
