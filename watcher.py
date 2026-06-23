@@ -47,9 +47,25 @@ class WatcherConfig:
     log_backup_count: int = 3
 
 
+def _load_user_config(install_dir: Path) -> dict:
+    """Load user config from config.json (written by menu bar settings)."""
+    config_file = install_dir / "config.json"
+    if config_file.exists():
+        try:
+            return json.loads(config_file.read_text())
+        except Exception:
+            pass
+    return {}
+
+
 def default_config() -> WatcherConfig:
     install_dir = Path(__file__).parent
-    transcripts = install_dir / "transcripts"
+    user = _load_user_config(install_dir)
+
+    # User can override transcripts path via menu bar settings
+    transcripts_path = user.get("transcripts_path", "")
+    transcripts = Path(transcripts_path) if transcripts_path else install_dir / "transcripts"
+
     return WatcherConfig(
         install_dir=install_dir,
         transcripts_dir=transcripts,
@@ -247,6 +263,15 @@ def start_capture(ctx: WatcherContext):
 
     env = os.environ.copy()
     env["TRANSCRIPT_FILE"] = str(ctx.current_transcript)
+
+    # Read user config for whisper model and diarization
+    user_cfg = _load_user_config(config.install_dir)
+    if user_cfg.get("whisper_model"):
+        env["WHISPER_MODEL"] = user_cfg["whisper_model"]
+    if user_cfg.get("diarization"):
+        env["DIARIZATION"] = user_cfg["diarization"]
+
+    # Env vars override config (for manual testing)
     for k in ("PASSTHROUGH", "WHISPER_MODEL", "DIARIZATION"):
         if k in os.environ:
             env[k] = os.environ[k]

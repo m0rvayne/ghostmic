@@ -14,9 +14,23 @@ from mcp.server.stdio import stdio_server
 from mcp import types
 
 INSTALL_DIR = Path(__file__).parent
-CURRENT = INSTALL_DIR / "transcripts" / "meeting_transcript.txt"
-TRANSCRIPTS_DIR = INSTALL_DIR / "transcripts"
 PID_FILE = INSTALL_DIR / "watcher.pid"
+
+def _load_transcripts_dir() -> Path:
+    config_file = INSTALL_DIR / "config.json"
+    if config_file.exists():
+        try:
+            import json as _json
+            data = _json.loads(config_file.read_text())
+            p = data.get("transcripts_path", "")
+            if p:
+                return Path(p)
+        except Exception:
+            pass
+    return INSTALL_DIR / "transcripts"
+
+TRANSCRIPTS_DIR = _load_transcripts_dir()
+CURRENT = TRANSCRIPTS_DIR / "meeting_transcript.txt"
 FRESHNESS_THRESHOLD = 180  # seconds
 MAX_TRANSCRIPT_BYTES = 50 * 1024 * 1024  # 50 MB
 MAX_PAST_MEETINGS = 200
