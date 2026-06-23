@@ -624,7 +624,17 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc func doOpenFolder() {
-        NSWorkspace.shared.open(URL(fileURLWithPath: transcriptsDir))
+        // Try current path, fallback to legacy path, create if needed
+        var dir = transcriptsDir
+        if !FileManager.default.fileExists(atPath: dir) {
+            let legacy = homePath + "/.meeting-transcript-mcp/transcripts"
+            if FileManager.default.fileExists(atPath: legacy) {
+                dir = legacy
+            } else {
+                try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+            }
+        }
+        NSWorkspace.shared.open(URL(fileURLWithPath: dir))
         menu.cancelTracking()
     }
 
