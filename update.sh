@@ -49,13 +49,32 @@ if [[ "$UPDATED" -eq 0 ]]; then
     ok "Everything already up to date"
 else
     ok "Updated $UPDATED file(s)"
-    # Auto-restart the LaunchAgent
+
+    # Rebuild Swift binaries if source changed
+    if command -v swiftc &>/dev/null; then
+        mkdir -p "$INSTALL_DIR/.build"
+        if [[ -f "$INSTALL_DIR/statusbar.swift" ]]; then
+            say "Rebuilding menu bar indicator..."
+            swiftc -O -framework AppKit "$INSTALL_DIR/statusbar.swift" -o "$INSTALL_DIR/.build/statusbar" 2>/dev/null && ok "Menu bar rebuilt"
+        fi
+        if [[ -f "$INSTALL_DIR/create-multi-output.swift" ]]; then
+            swiftc -O -framework CoreAudio -framework CoreFoundation "$INSTALL_DIR/create-multi-output.swift" -o "$INSTALL_DIR/.build/create-multi-output" 2>/dev/null
+        fi
+    fi
+
+    # Restart watcher
     say "Restarting watcher..."
     if launchctl kickstart -k "gui/$(id -u)/$LAUNCH_LABEL" 2>/dev/null; then
-        ok "Watcher restarted with new code"
+        ok "Watcher restarted"
     else
-        warn "Could not auto-restart. Restart manually:"
-        warn "  launchctl bootout gui/$(id -u)/$LAUNCH_LABEL"
-        warn "  launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/$LAUNCH_LABEL.plist"
+        warn "Could not restart watcher"
+    fi
+
+    # Restart menu bar indicator
+    STATUSBAR_LABEL="com.meeting-transcript.statusbar"
+    if launchctl kickstart -k "gui/$(id -u)/$STATUSBAR_LABEL" 2>/dev/null; then
+        ok "Menu bar restarted"
+    else
+        warn "Could not restart menu bar indicator"
     fi
 fi
