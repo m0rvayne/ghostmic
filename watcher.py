@@ -69,6 +69,7 @@ def default_config() -> WatcherConfig:
 class State(Enum):
     IDLE = auto()
     RECORDING = auto()
+    PAUSED = auto()
     GRACE_PERIOD = auto()
     BACKOFF = auto()
 
@@ -243,7 +244,6 @@ def start_capture(ctx: WatcherContext):
 
     update_symlink(config, ctx.current_transcript)
     write_status(config, "RECORDING", ctx.current_transcript.name)
-    notify("Meeting recording started", f"Transcript: {ctx.current_transcript.name}")
 
     env = os.environ.copy()
     env["TRANSCRIPT_FILE"] = str(ctx.current_transcript)
@@ -287,7 +287,6 @@ def stop_capture(ctx: WatcherContext):
     write_status(ctx.config, "IDLE")
     ctx.state = State.IDLE
     logger.info(f"Recording stopped. Transcript: {saved_name}")
-    notify("Meeting recording stopped", f"Saved: {saved_name}")
 
 
 def notify(title: str, message: str):
@@ -307,8 +306,23 @@ def notify(title: str, message: str):
 # Main loop
 # --------------------------------------------------------------------------
 
+def _read_control(config: WatcherConfig) -> str | None:
+    """Read and consume a control command from the menu bar app."""
+    control_path = config.install_dir / "watcher-control.json"
+    if not control_path.exists():
+        return None
+    try:
+        data = json.loads(control_path.read_text())
+        control_path.unlink()
+        return data.get("action")
+    except Exception:
+        return None
+
+
 def tick(ctx: WatcherContext):
     """Single iteration of the watcher state machine."""
+    config = ctx.config
+
     # Handle backoff: return early until timer expires
     if ctx.state == State.BACKOFF:
         if time.time() < ctx.backoff_until:
@@ -316,6 +330,28 @@ def tick(ctx: WatcherContext):
         logger.info("Backoff period ended — resuming normal operation")
         ctx.state = State.IDLE
         ctx.backoff_until = None
+
+    # Check for menu bar control commands
+    control = _read_control(config)
+    if control:
+        is_active = ctx.capture_process is not None and ctx.capture_process.poll() is None
+        if control == "pause" and is_active and ctx.state == State.RECORDING:
+            ctx.capture_process.send_signal(signal.SIGSTOP)
+            ctx.state = State.PAUSED
+            write_status(config, "PAUSED")
+            logger.info("Recording paused (user request)")
+        elif control == "resume" and ctx.state == State.PAUSED:
+            ctx.capture_process.send_signal(signal.SIGCONT)
+            ctx.state = State.RECORDING
+            name = ctx.current_transcript.name if ctx.current_transcript else "unknown"
+            write_status(config, "RECORDING", name)
+            logger.info("Recording resumed (user request)")
+        elif control == "end" and is_active:
+            if ctx.state == State.PAUSED:
+                ctx.capture_process.send_signal(signal.SIGCONT)
+            logger.info("Recording ended (user request)")
+            stop_capture(ctx)
+            return
 
     try:
         in_conf = is_in_conference()
@@ -332,7 +368,7 @@ def tick(ctx: WatcherContext):
         if ctx.state == State.GRACE_PERIOD and is_recording:
             logger.info("Meeting reconnected during grace period")
         ctx.grace_start = None
-        if not is_recording:
+        if not is_recording and ctx.state != State.PAUSED:
             logger.info("Meeting detected — starting capture")
             start_capture(ctx)
     else:
