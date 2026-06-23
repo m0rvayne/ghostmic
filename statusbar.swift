@@ -263,6 +263,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     var statusRow = NSStackView()
     var timerRow = NSStackView()
     var gotoBtn = LinkButton()
+    var gotoButton = HoverButton()
 
     // Settings items (hidden by default)
     var settingsItems: [NSMenuItem] = []
@@ -341,9 +342,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         si.view = padded(statusRow, h: 14, v: 4)
         menu.addItem(si)
 
-        // Go To File — styled button
+        // Open button — changes between "Open Transcript" and "Open Folder"
         let gotoItem = NSMenuItem()
-        let gotoButton = HoverButton.make(title: "Open Transcript", color: kBlue, target: self, action: #selector(doGoToFile))
+        gotoButton = HoverButton.make(title: "Open Folder", color: kBlue, target: self, action: #selector(doGoToFile))
         gotoButton.font = .systemFont(ofSize: 11, weight: .medium)
         gotoItem.view = padded(gotoButton, h: 14, v: 4)
         menu.addItem(gotoItem)
@@ -486,26 +487,37 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     func makeHeader() -> NSView {
         let container = NSView(); container.translatesAutoresizingMaskIntoConstraints = false
-        let logoText = NSAttributedString(string: "M 0 R V A Y N E", attributes: [
-            .foregroundColor: NSColor.white.withAlphaComponent(0.75),
+
+        // Project name
+        let logoText = NSAttributedString(string: "G H O S T M I C", attributes: [
+            .foregroundColor: NSColor.white.withAlphaComponent(0.8),
             .font: NSFont.systemFont(ofSize: 11, weight: .bold),
-            .kern: 3.0,
+            .kern: 2.5,
         ])
         let nameLabel = NSTextField(labelWithAttributedString: logoText)
         nameLabel.alignment = .center; nameLabel.translatesAutoresizingMaskIntoConstraints = false
+
+        // Accent line
         let accent = NSView(); accent.wantsLayer = true
         accent.layer?.backgroundColor = kBlue.withAlphaComponent(0.4).cgColor
         accent.layer?.cornerRadius = 0.5; accent.translatesAutoresizingMaskIntoConstraints = false
-        container.addSubview(nameLabel); container.addSubview(accent)
+
+        // Author
+        let authorLabel = lbl("by m0rvayne", size: 9, weight: .regular, color: .white.withAlphaComponent(0.25))
+        authorLabel.alignment = .center
+
+        container.addSubview(nameLabel); container.addSubview(accent); container.addSubview(authorLabel)
         NSLayoutConstraint.activate([
-            container.heightAnchor.constraint(equalToConstant: 42),
+            container.heightAnchor.constraint(equalToConstant: 50),
             container.widthAnchor.constraint(equalToConstant: kWidth),
             nameLabel.centerXAnchor.constraint(equalTo: container.centerXAnchor),
-            nameLabel.centerYAnchor.constraint(equalTo: container.centerYAnchor, constant: -3),
+            nameLabel.topAnchor.constraint(equalTo: container.topAnchor, constant: 10),
             accent.topAnchor.constraint(equalTo: nameLabel.bottomAnchor, constant: 4),
             accent.centerXAnchor.constraint(equalTo: container.centerXAnchor),
-            accent.widthAnchor.constraint(equalToConstant: 40),
+            accent.widthAnchor.constraint(equalToConstant: 36),
             accent.heightAnchor.constraint(equalToConstant: 1.5),
+            authorLabel.centerXAnchor.constraint(equalTo: container.centerXAnchor),
+            authorLabel.topAnchor.constraint(equalTo: accent.bottomAnchor, constant: 3),
         ])
         return container
     }
@@ -541,21 +553,23 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         // Ghost icon stays the same — always the outline ghost
         // State is shown inside the menu, not in the icon
         buttonsRow.isHidden = !active
+        statusRow.isHidden = !active
         if state == "RECORDING" {
             statusDot.layer?.backgroundColor = kGreen.cgColor
             statusLabel.stringValue = "Transcript active"; statusLabel.textColor = .white.withAlphaComponent(0.9)
             pauseBtn.title = "PAUSE"; pauseBtn.contentTintColor = kPauseYellow
             pauseBtn.layer?.borderColor = kPauseYellow.withAlphaComponent(0.35).cgColor
+            gotoButton.title = "Open Transcript"; gotoButton.action = #selector(doGoToFile)
             startPulse()
         } else if state == "PAUSED" {
             statusDot.layer?.backgroundColor = kPauseYellow.cgColor
             statusLabel.stringValue = "Paused"; statusLabel.textColor = kPauseYellow
             pauseBtn.title = "RESUME"; pauseBtn.contentTintColor = kGreen
             pauseBtn.layer?.borderColor = kGreen.withAlphaComponent(0.35).cgColor
+            gotoButton.title = "Open Transcript"; gotoButton.action = #selector(doGoToFile)
             stopPulse()
         } else {
-            statusDot.layer?.backgroundColor = kDimText.cgColor
-            statusLabel.stringValue = "No active recording"; statusLabel.textColor = kDimText
+            gotoButton.title = "Open Folder"; gotoButton.action = #selector(doOpenFolder)
             stopPulse()
         }
         updateTimer()
@@ -597,8 +611,13 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     @objc func doRestart() { writeControl("end"); menu.cancelTracking() }
 
     @objc func doGoToFile() {
-        guard !transcriptName.isEmpty else { return }
+        guard !transcriptName.isEmpty else { doOpenFolder(); return }
         NSWorkspace.shared.open(URL(fileURLWithPath: transcriptsDir + "/" + transcriptName))
+        menu.cancelTracking()
+    }
+
+    @objc func doOpenFolder() {
+        NSWorkspace.shared.open(URL(fileURLWithPath: transcriptsDir))
         menu.cancelTracking()
     }
 
