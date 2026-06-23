@@ -366,19 +366,29 @@ def tick(ctx: WatcherContext):
 
     if in_conf:
         if ctx.state == State.GRACE_PERIOD and is_recording:
-            logger.info("Meeting reconnected during grace period")
-        ctx.grace_start = None
-        if not is_recording and ctx.state != State.PAUSED:
+            # Conference came back during grace period — this could be a reconnect
+            # (same meeting) or a new meeting. We can't tell the difference, so
+            # stop the old recording and start fresh to be safe.
+            logger.info("New meeting detected during grace period — restarting capture")
+            stop_capture(ctx)
+            ctx.grace_start = None
+            start_capture(ctx)
+        elif not is_recording and ctx.state != State.PAUSED:
+            ctx.grace_start = None
             logger.info("Meeting detected — starting capture")
             start_capture(ctx)
+        else:
+            ctx.grace_start = None
     else:
-        if is_recording:
+        if is_recording or ctx.state == State.PAUSED:
             if ctx.grace_start is None:
                 ctx.grace_start = time.time()
                 ctx.state = State.GRACE_PERIOD
                 logger.info(f"Meeting ended — waiting {ctx.config.grace_period}s grace period...")
             elif time.time() - ctx.grace_start >= ctx.config.grace_period:
                 logger.info("Grace period elapsed — stopping capture")
+                if ctx.state == State.PAUSED and ctx.capture_process:
+                    ctx.capture_process.send_signal(signal.SIGCONT)
                 stop_capture(ctx)
                 ctx.grace_start = None
 
