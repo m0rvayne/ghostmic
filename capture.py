@@ -273,10 +273,48 @@ def tap_reader_thread(proc: subprocess.Popen):
         shutdown_event.set()
 
 
+# -- Zoom mute detection -------------------------------------------------------
+
+_zoom_muted = False
+
+
+def _check_zoom_mute() -> bool:
+    """Check if Zoom mic is muted via AppleScript menu inspection."""
+    try:
+        r = subprocess.run(
+            ["osascript", "-e", '''tell application "System Events"
+    tell process "zoom.us"
+        if exists (menu bar item "Meeting" of menu bar 1) then
+            if exists (menu item "Unmute Audio" of menu 1 of menu bar item "Meeting" of menu bar 1) then
+                return "muted"
+            else
+                return "unmuted"
+            end if
+        else
+            return "no-meeting"
+        end if
+    end tell
+end tell'''],
+            capture_output=True, text=True, timeout=3
+        )
+        return r.stdout.strip() == "muted"
+    except Exception:
+        return False
+
+
+def mute_monitor_thread():
+    """Poll Zoom mute status every 2 seconds."""
+    global _zoom_muted
+    while not shutdown_event.is_set():
+        _zoom_muted = _check_zoom_mute()
+        shutdown_event.wait(timeout=2.0)
+
+
 # -- Mic reader (sounddevice, for [You] labels) -------------------------------
 
 def start_mic_stream():
-    """Start microphone capture via sounddevice for speaker diarization."""
+    """Start microphone capture via sounddevice for speaker diarization.
+    When Zoom is muted, mic data is replaced with silence to protect privacy."""
     try:
         import sounddevice as sd
 
@@ -299,6 +337,14 @@ def start_mic_stream():
         def mic_callback(indata, frames, time_info, status):
             if status:
                 print(f"[mic] {status}", file=sys.stderr)
+            # Privacy: when Zoom mic is muted, send silence instead of real mic audio
+            # This prevents private conversations from being transcribed
+            if _zoom_muted:
+                try:
+                    mic_queue.put_nowait(np.zeros_like(indata))
+                except queue.Full:
+                    pass
+                return
             try:
                 mic_queue.put_nowait(indata.copy())
             except queue.Full:
@@ -387,6 +433,11 @@ def main():
     if ENABLE_DIARIZATION:
         mic_stream = start_mic_stream()
         has_mic = mic_stream is not None
+
+    # Start Zoom mute monitor (privacy: don't record mic when muted)
+    if has_mic:
+        threading.Thread(target=mute_monitor_thread, daemon=True).start()
+        print("[meeting] Zoom mute monitor active — mic silenced when muted", flush=True)
 
     # Load Whisper model
     from faster_whisper import WhisperModel
