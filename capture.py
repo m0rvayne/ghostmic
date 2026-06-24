@@ -101,36 +101,66 @@ def _build_diarized_text(text: str, segments: list[tuple[str, int, int]],
     return f"{dominant} {text}"
 
 
-# -- Transcription ------------------------------------------------------------
+# -- Transcription (whisper.cpp with Metal GPU) --------------------------------
+
+WHISPER_CLI = os.environ.get("WHISPER_CLI", "whisper-cli")
+WHISPER_MODEL_PATH = os.environ.get("WHISPER_MODEL_PATH",
+    str(Path(__file__).parent / "models" / "ggml-large-v3-turbo.bin"))
+
 
 def format_time(dt: datetime) -> str:
     return dt.strftime("%H:%M:%S")
 
 
-def transcribe_chunk(model, audio_np: np.ndarray) -> str:
-    global _detected_language
-    lang = None if LANGUAGE == "auto" else LANGUAGE
-    if lang is None:
-        lang = _detected_language  # use locked language if available
+def transcribe_chunk(model_unused, audio_np: np.ndarray) -> str:
+    """Transcribe audio using whisper.cpp CLI with Metal GPU acceleration."""
+    lang = LANGUAGE if LANGUAGE != "auto" else "auto"
 
-    segments, info = model.transcribe(
-        audio_np,
-        language=lang,
-        beam_size=1,
-        vad_filter=True,
-        vad_parameters={"min_silence_duration_ms": 500},
-        condition_on_previous_text=False,
-        no_speech_threshold=0.6,
-        compression_ratio_threshold=2.4,
-    )
-    text_parts = []
-    for seg in segments:
-        text_parts.append(seg.text.strip())
-    text = " ".join(text_parts).strip()
+    # Convert float32 audio to int16 WAV via ffmpeg
+    pcm_data = (audio_np * 32768).astype(np.int16).tobytes()
 
-    if lang is None and _detected_language is None and text and info.language and info.language_probability > 0.7:
-        _detected_language = info.language
-        print(f"[meeting] Language locked: {info.language} (probability: {info.language_probability:.2f})", flush=True)
+    # ffmpeg: raw PCM → WAV on stdout, pipe to whisper-cli
+    ffmpeg_cmd = [
+        "ffmpeg", "-f", "s16le", "-ar", "16000", "-ac", "1",
+        "-i", "pipe:0", "-f", "wav", "pipe:1"
+    ]
+    whisper_cmd = [
+        WHISPER_CLI,
+        "-m", WHISPER_MODEL_PATH,
+        "-f", "-",
+        "--no-timestamps",
+        "-t", "4",
+    ]
+    if lang != "auto":
+        whisper_cmd.extend(["-l", lang])
+
+    try:
+        # ffmpeg converts PCM→WAV, pipes to whisper-cli
+        ffmpeg_proc = subprocess.Popen(
+            ffmpeg_cmd,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+        )
+        whisper_proc = subprocess.Popen(
+            whisper_cmd,
+            stdin=ffmpeg_proc.stdout,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+        )
+        ffmpeg_proc.stdout.close()
+        ffmpeg_proc.stdin.write(pcm_data)
+        ffmpeg_proc.stdin.close()
+
+        output, _ = whisper_proc.communicate(timeout=30)
+        text = output.decode("utf-8", errors="replace").strip()
+
+        # whisper-cli outputs with leading whitespace and [BLANK_AUDIO] markers
+        text = text.replace("[BLANK_AUDIO]", "").strip()
+
+        # Remove any SRT-like timestamp lines that might leak through
+        lines = [l.strip() for l in text.split("\n") if l.strip() and not l.strip().startswith("[")]
+        text = " ".join(lines).strip()
 
     return text
 
@@ -475,28 +505,21 @@ def main():
         threading.Thread(target=mute_monitor_thread, daemon=True).start()
         print("[meeting] Zoom mute monitor active — mic silenced when muted", flush=True)
 
-    # Load Whisper model
-    from faster_whisper import WhisperModel
-    print(f"[meeting] Loading Whisper model '{MODEL_SIZE}'...", flush=True)
-    model = WhisperModel(MODEL_SIZE, device="cpu", compute_type="int8")
-    print("[meeting] Model ready.", flush=True)
+    # Verify whisper.cpp is available
+    model = None  # not used — whisper-cli is called as subprocess
+    try:
+        r = subprocess.run([WHISPER_CLI, "--help"], capture_output=True, timeout=5)
+        print(f"[meeting] whisper.cpp ready (Metal GPU)", flush=True)
+    except FileNotFoundError:
+        print(f"[meeting] ERROR: whisper-cli not found. Install: brew install whisper-cpp", file=sys.stderr)
+        sys.exit(1)
 
-    # Drain any audio that accumulated during model loading
-    # so the first chunk isn't 60+ seconds long
-    drained = 0
-    while not audio_queue.empty():
-        try:
-            audio_queue.get_nowait()
-            drained += 1
-        except queue.Empty:
-            break
-    while not mic_queue.empty():
-        try:
-            mic_queue.get_nowait()
-        except queue.Empty:
-            break
-    if drained:
-        print(f"[meeting] Drained {drained} buffered chunks from model loading", flush=True)
+    if not Path(WHISPER_MODEL_PATH).exists():
+        print(f"[meeting] ERROR: Model not found: {WHISPER_MODEL_PATH}", file=sys.stderr)
+        print(f"[meeting] Download: curl -L -o {WHISPER_MODEL_PATH} https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3-turbo.bin", file=sys.stderr)
+        sys.exit(1)
+
+    print(f"[meeting] Model: {Path(WHISPER_MODEL_PATH).name}, Language: {LANGUAGE}", flush=True)
 
     def handle_signal(sig, frame):
         shutdown_event.set()
