@@ -445,6 +445,23 @@ def main():
     model = WhisperModel(MODEL_SIZE, device="cpu", compute_type="int8")
     print("[meeting] Model ready.", flush=True)
 
+    # Drain any audio that accumulated during model loading
+    # so the first chunk isn't 60+ seconds long
+    drained = 0
+    while not audio_queue.empty():
+        try:
+            audio_queue.get_nowait()
+            drained += 1
+        except queue.Empty:
+            break
+    while not mic_queue.empty():
+        try:
+            mic_queue.get_nowait()
+        except queue.Empty:
+            break
+    if drained:
+        print(f"[meeting] Drained {drained} buffered chunks from model loading", flush=True)
+
     def handle_signal(sig, frame):
         shutdown_event.set()
 
