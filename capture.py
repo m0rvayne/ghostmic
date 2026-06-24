@@ -111,9 +111,12 @@ def transcribe_chunk(model, audio_np: np.ndarray) -> str:
     segments, info = model.transcribe(
         audio_np,
         language=_detected_language,
-        beam_size=5,
+        beam_size=1,
         vad_filter=True,
         vad_parameters={"min_silence_duration_ms": 500},
+        condition_on_previous_text=False,
+        no_speech_threshold=0.6,
+        compression_ratio_threshold=2.4,
     )
     text_parts = []
     for seg in segments:
@@ -254,6 +257,18 @@ def writer_thread(model, has_mic: bool):
 
 # -- CoreAudio Tap reader (reads PCM from process-audio-tap stdout) -----------
 
+def _read_exactly(stream, n: int) -> bytes:
+    """Read exactly n bytes from a raw stream, handling short reads."""
+    buf = bytearray()
+    raw = stream.raw if hasattr(stream, 'raw') else stream
+    while len(buf) < n:
+        chunk = raw.read(n - len(buf))
+        if not chunk:
+            return bytes(buf) if buf else b''
+        buf.extend(chunk)
+    return bytes(buf)
+
+
 def tap_reader_thread(proc: subprocess.Popen):
     """Read raw PCM (16-bit LE, 16kHz, mono) from tap subprocess stdout."""
     BYTES_PER_SAMPLE = 2
@@ -262,7 +277,7 @@ def tap_reader_thread(proc: subprocess.Popen):
 
     try:
         while not shutdown_event.is_set():
-            data = proc.stdout.read(CHUNK_BYTES)
+            data = _read_exactly(proc.stdout, CHUNK_BYTES)
             if not data:
                 print("[meeting] Tap process ended", flush=True)
                 shutdown_event.set()
@@ -387,6 +402,7 @@ def main():
             [str(AUDIO_TAP_BIN), "--bundle-id", BUNDLE_ID],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
+            bufsize=0,
         )
 
         # Stream tap stderr to our stderr

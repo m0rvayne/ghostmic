@@ -437,8 +437,9 @@ class ProcessAudioTap {
         self.aggregateDeviceID = aggDeviceID
         fputs("Created aggregate device: \(aggDeviceID)\n", stderr)
 
-        // 6. Set up I/O proc to receive audio buffers
+        // 6. Set up ring buffer + writer thread (never block the audio callback)
         let converterRef = self.converter!
+        let outputQueue = DispatchQueue(label: "stdout-writer")
         let stdout = FileHandle.standardOutput
 
         err = AudioDeviceCreateIOProcIDWithBlock(&deviceProcID, aggregateDeviceID, queue) {
@@ -446,23 +447,19 @@ class ProcessAudioTap {
 
             let bufferList = UnsafeMutableAudioBufferListPointer(UnsafeMutablePointer(mutating: inInputData))
 
-            var totalBytes = 0
             for buf in bufferList {
                 let dataSize = Int(buf.mDataByteSize)
                 guard let mData = buf.mData, dataSize > 0 else { continue }
-                totalBytes += dataSize
 
                 if let converted = converterRef.convert(inputData: mData, inputByteCount: dataSize) {
                     if !converted.isEmpty {
-                        stdout.write(converted)
+                        // Copy data and write on a separate thread — never block the audio callback
+                        let copy = Data(converted)
+                        outputQueue.async {
+                            stdout.write(copy)
+                        }
                     }
                 }
-            }
-            // Debug: log first few callbacks
-            struct CallbackCounter { static var count = 0 }
-            CallbackCounter.count += 1
-            if CallbackCounter.count <= 5 {
-                fputs("Callback #\(CallbackCounter.count): \(totalBytes) bytes in \(bufferList.count) buffers\n", stderr)
             }
         }
         guard err == noErr else {
