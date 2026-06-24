@@ -162,6 +162,10 @@ def transcribe_chunk(model_unused, audio_np: np.ndarray) -> str:
         lines = [l.strip() for l in text.split("\n") if l.strip() and not l.strip().startswith("[")]
         text = " ".join(lines).strip()
 
+    except Exception as e:
+        print(f"[meeting] Transcription error: {e}", file=sys.stderr, flush=True)
+        text = ""
+
     return text
 
 
