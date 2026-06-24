@@ -25,12 +25,13 @@ import numpy as np
 
 SAMPLE_RATE = 16000
 CHANNELS = 1
-CHUNK_SECONDS = 15
+CHUNK_SECONDS = 10
 MAX_QUEUE_CHUNKS = 240  # ~4 min of audio in queue items
 _DEFAULT_TRANSCRIPT = Path(__file__).parent / "transcripts" / "meeting_transcript.txt"
 TRANSCRIPT_FILE = Path(os.environ.get("TRANSCRIPT_FILE", _DEFAULT_TRANSCRIPT))
 MODEL_SIZE = os.environ.get("WHISPER_MODEL", "small")
 ENABLE_DIARIZATION = os.environ.get("DIARIZATION", "1") == "1"
+LANGUAGE = os.environ.get("LANGUAGE", "ru")  # forced language, "auto" for auto-detect
 CAPTURE_MODE = os.environ.get("CAPTURE_MODE", "coreaudio")  # "coreaudio" or "legacy"
 BUNDLE_ID = os.environ.get("BUNDLE_ID", "us.zoom.xos")
 
@@ -108,9 +109,13 @@ def format_time(dt: datetime) -> str:
 
 def transcribe_chunk(model, audio_np: np.ndarray) -> str:
     global _detected_language
+    lang = None if LANGUAGE == "auto" else LANGUAGE
+    if lang is None:
+        lang = _detected_language  # use locked language if available
+
     segments, info = model.transcribe(
         audio_np,
-        language=_detected_language,
+        language=lang,
         beam_size=1,
         vad_filter=True,
         vad_parameters={"min_silence_duration_ms": 500},
@@ -123,11 +128,9 @@ def transcribe_chunk(model, audio_np: np.ndarray) -> str:
         text_parts.append(seg.text.strip())
     text = " ".join(text_parts).strip()
 
-    if _detected_language is None and text and info.language and info.language_probability > 0.7:
+    if lang is None and _detected_language is None and text and info.language and info.language_probability > 0.7:
         _detected_language = info.language
         print(f"[meeting] Language locked: {info.language} (probability: {info.language_probability:.2f})", flush=True)
-    elif _detected_language is None and text and info.language:
-        print(f"[meeting] Language guess: {info.language} (probability: {info.language_probability:.2f}) — too low to lock", flush=True)
 
     return text
 

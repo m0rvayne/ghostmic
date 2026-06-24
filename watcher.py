@@ -270,13 +270,15 @@ def start_capture(ctx: WatcherContext):
         env["WHISPER_MODEL"] = user_cfg["whisper_model"]
     if user_cfg.get("diarization"):
         env["DIARIZATION"] = user_cfg["diarization"]
+    if user_cfg.get("language"):
+        env["LANGUAGE"] = user_cfg["language"]
 
     # CoreAudio Tap mode — pass bundle ID
     env.setdefault("CAPTURE_MODE", "coreaudio")
     env.setdefault("BUNDLE_ID", "us.zoom.xos")
 
     # Env vars override config (for manual testing)
-    for k in ("PASSTHROUGH", "WHISPER_MODEL", "DIARIZATION", "CAPTURE_MODE", "BUNDLE_ID"):
+    for k in ("PASSTHROUGH", "WHISPER_MODEL", "DIARIZATION", "LANGUAGE", "CAPTURE_MODE", "BUNDLE_ID"):
         if k in os.environ:
             env[k] = os.environ[k]
 
