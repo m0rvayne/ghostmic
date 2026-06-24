@@ -271,8 +271,12 @@ def start_capture(ctx: WatcherContext):
     if user_cfg.get("diarization"):
         env["DIARIZATION"] = user_cfg["diarization"]
 
+    # CoreAudio Tap mode — pass bundle ID
+    env.setdefault("CAPTURE_MODE", "coreaudio")
+    env.setdefault("BUNDLE_ID", "us.zoom.xos")
+
     # Env vars override config (for manual testing)
-    for k in ("PASSTHROUGH", "WHISPER_MODEL", "DIARIZATION"):
+    for k in ("PASSTHROUGH", "WHISPER_MODEL", "DIARIZATION", "CAPTURE_MODE", "BUNDLE_ID"):
         if k in os.environ:
             env[k] = os.environ[k]
 

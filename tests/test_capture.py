@@ -17,37 +17,6 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 import capture as capture_mod
 
 
-class TestResampleLinear:
-    """Test the ACTUAL _resample_linear from capture.py."""
-
-    def test_same_rate_passthrough(self):
-        data = np.random.randn(16000).astype(np.float32)
-        result = capture_mod._resample_linear(data, 16000, 16000)
-        np.testing.assert_array_equal(result, data)
-
-    def test_upsample_length(self):
-        data = np.ones(16000, dtype=np.float32)
-        result = capture_mod._resample_linear(data, 16000, 48000)
-        assert len(result) == 48000
-
-    def test_downsample_length(self):
-        data = np.ones(48000, dtype=np.float32)
-        result = capture_mod._resample_linear(data, 48000, 16000)
-        assert len(result) == 16000
-
-    def test_preserves_dc(self):
-        data = np.full(16000, 0.5, dtype=np.float32)
-        result = capture_mod._resample_linear(data, 16000, 48000)
-        np.testing.assert_allclose(result, 0.5, atol=1e-6)
-
-    def test_sine_wave_integrity(self):
-        t = np.linspace(0, 1, 16000, endpoint=False)
-        data = np.sin(2 * np.pi * 100 * t).astype(np.float32)
-        upsampled = capture_mod._resample_linear(data, 16000, 48000)
-        assert len(upsampled) == 48000
-        assert abs(upsampled[0]) < 0.1
-
-
 class TestAudioMixing:
     """Mixing behavior: average with clip safety."""
 

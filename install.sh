@@ -69,19 +69,10 @@ else
     ok "Homebrew installed"
 fi
 
-# ── 2. BlackHole ─────────────────────────────────────────────────────────────
-say "Installing BlackHole 2ch (virtual audio driver)..."
-if brew list --cask blackhole-2ch &>/dev/null 2>&1 || brew list blackhole-2ch &>/dev/null 2>&1; then
-    ok "BlackHole 2ch already installed"
-else
-    if ! brew install blackhole-2ch; then
-        err "BlackHole install failed. Try: brew install blackhole-2ch"
-        err "You may need to reboot after installation."
-        exit 1
-    fi
-    ok "BlackHole 2ch installed"
-    warn "A reboot may be needed for BlackHole to appear as an audio device"
-fi
+# ── 2. CoreAudio Tap (replaces BlackHole — no virtual driver needed) ─────────
+say "Building audio capture tool..."
+command -v swiftc &>/dev/null || { err "Xcode Command Line Tools required: xcode-select --install"; exit 1; }
+# BlackHole is no longer required — CoreAudio Process Taps capture app audio directly
 
 # ── 3. Python ────────────────────────────────────────────────────────────────
 say "Checking Python..."
@@ -122,10 +113,17 @@ launchctl bootout "gui/$(id -u)/$LAUNCH_LABEL" 2>/dev/null || true
 # ── 5. Copy files ────────────────────────────────────────────────────────────
 say "Installing to $INSTALL_DIR..."
 mkdir -p "$INSTALL_DIR/transcripts"
-for f in server.py capture.py watcher.py setup-audio.sh requirements.txt update.sh create-multi-output.swift statusbar.swift; do
+for f in server.py capture.py watcher.py requirements.txt update.sh process-audio-tap.swift statusbar.swift; do
     [[ -f "$SCRIPT_DIR/$f" ]] && cp "$SCRIPT_DIR/$f" "$INSTALL_DIR/"
 done
-chmod +x "$INSTALL_DIR/setup-audio.sh" 2>/dev/null || true
+# Compile CoreAudio tap binary
+mkdir -p "$INSTALL_DIR/.build"
+if swiftc -O -framework CoreAudio -framework AudioToolbox -framework AppKit "$INSTALL_DIR/process-audio-tap.swift" -o "$INSTALL_DIR/.build/process-audio-tap" 2>&1; then
+    ok "Audio capture tool compiled (CoreAudio Process Taps)"
+else
+    err "Failed to compile audio capture tool"
+    exit 1
+fi
 
 # ── 6. Python venv + deps ───────────────────────────────────────────────────
 say "Installing Python dependencies..."
@@ -151,9 +149,8 @@ print('  Done.', flush=True)
 fi
 ok "Whisper model ready"
 
-# ── 8. Auto-create Multi-Output Device ───────────────────────────────────────
-say "Setting up audio routing (Multi-Output Device)..."
-bash "$INSTALL_DIR/setup-audio.sh" 2>&1 || warn "Audio setup had issues — run manually: bash $INSTALL_DIR/setup-audio.sh"
+# ── 8. Audio setup — not needed with CoreAudio Taps ─────────────────────────
+ok "No audio routing setup needed — CoreAudio captures Zoom directly"
 
 # ── 9. Claude Desktop config ────────────────────────────────────────────────
 say "Configuring Claude Desktop..."
@@ -285,15 +282,15 @@ cat << SUMMARY
 
   Location: $INSTALL_DIR
 
-  LAST STEP — In Zoom (one-time):
-  Settings → Audio → Speaker → "Zoom + Transcript"
+  No audio setup needed — ghostmic captures Zoom audio directly.
+  No BlackHole, no speaker changes, no Multi-Output Device.
 
-  Everything else is automatic:
+  Everything is automatic:
   - Watcher daemon detects Zoom meetings and starts recording
-  - Menu bar shows 🔴 when recording
+  - Menu bar ghost icon shows recording status
   - Claude Desktop + Claude Code are configured
 
-  Restart Claude Desktop: Cmd+Q → reopen
+  Just restart Claude Desktop: Cmd+Q → reopen
 
   Then just ask Claude:
     "what are they talking about?"

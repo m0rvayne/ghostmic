@@ -1,249 +1,56 @@
 #!/usr/bin/env python3
 """
-Meeting transcript capture with built-in audio passthrough.
+ghostmic — audio capture + transcription.
 
-Architecture:
-  Zoom -> BlackHole 2ch -> capture.py -> Whisper (transcription)
-                                       -> Default output (speakers/headphones)
+Two capture modes:
+  CoreAudio Tap (default, macOS 14.4+):
+    process-audio-tap --bundle-id <app> → stdout → this script reads PCM
+    No BlackHole, no Multi-Output Device, no user config needed.
+
+  Legacy (CAPTURE_MODE=legacy):
+    BlackHole 2ch → sounddevice → this script
+    Requires BlackHole install + Multi-Output Device + Zoom speaker config.
 """
 import sys
 import os
 import queue
 import signal
+import subprocess
 import time
 import threading
 from datetime import datetime
 from pathlib import Path
 
 import numpy as np
-import sounddevice as sd
-from faster_whisper import WhisperModel
 
 SAMPLE_RATE = 16000
 CHANNELS = 1
 CHUNK_SECONDS = 30
-MAX_QUEUE_CHUNKS = 8  # ~4 min of audio — prevents OOM if Whisper falls behind
+MAX_QUEUE_CHUNKS = 240  # ~4 min of audio in queue items
 _DEFAULT_TRANSCRIPT = Path(__file__).parent / "transcripts" / "meeting_transcript.txt"
 TRANSCRIPT_FILE = Path(os.environ.get("TRANSCRIPT_FILE", _DEFAULT_TRANSCRIPT))
 MODEL_SIZE = os.environ.get("WHISPER_MODEL", "small")
-ENABLE_PASSTHROUGH = os.environ.get("PASSTHROUGH", "0") == "1"
 ENABLE_DIARIZATION = os.environ.get("DIARIZATION", "1") == "1"
-PASSTHROUGH_RATE = 48000
+CAPTURE_MODE = os.environ.get("CAPTURE_MODE", "coreaudio")  # "coreaudio" or "legacy"
+BUNDLE_ID = os.environ.get("BUNDLE_ID", "us.zoom.xos")
 
-# Bounded queues to prevent OOM
-audio_queue = queue.Queue(maxsize=MAX_QUEUE_CHUNKS * SAMPLE_RATE * CHUNK_SECONDS // SAMPLE_RATE)
-mic_queue = queue.Queue(maxsize=MAX_QUEUE_CHUNKS * SAMPLE_RATE * CHUNK_SECONDS // SAMPLE_RATE)
-passthrough_queue = queue.Queue(maxsize=200)
+AUDIO_TAP_BIN = Path(__file__).parent / ".build" / "process-audio-tap"
+
+# Bounded queues
+audio_queue = queue.Queue(maxsize=MAX_QUEUE_CHUNKS)
+mic_queue = queue.Queue(maxsize=MAX_QUEUE_CHUNKS)
 shutdown_event = threading.Event()
-error_event = threading.Event()  # set by writer_thread on fatal error
+error_event = threading.Event()
 
 
-# -- Auto-detect audio devices ------------------------------------------------
-
-def find_device(name_patterns: list[str], input_only: bool = True) -> int | None:
-    devices = sd.query_devices()
-    for i, d in enumerate(devices):
-        if input_only and d["max_input_channels"] == 0:
-            continue
-        name = d["name"].lower()
-        for pattern in name_patterns:
-            if pattern.lower() in name:
-                return i
-    return None
-
-
-def find_output_device() -> int | None:
-    """Find current default output device (NOT BlackHole)."""
-    default_out = sd.default.device[1]
-    if default_out is not None:
-        dev = sd.query_devices(default_out)
-        if "blackhole" not in dev["name"].lower() and dev["max_output_channels"] > 0:
-            return default_out
-    for i, d in enumerate(sd.query_devices()):
-        if d["max_output_channels"] > 0 and "blackhole" not in d["name"].lower():
-            return i
-    return None
-
-
-def detect_devices() -> tuple[int, int | None]:
-    blackhole = find_device(["blackhole 2ch", "blackhole"], input_only=True)
-    if blackhole is None:
-        print("[meeting] BlackHole not found! Install: brew install blackhole-2ch", file=sys.stderr)
-        for i, d in enumerate(sd.query_devices()):
-            if d["max_input_channels"] > 0:
-                print(f"  [{i}] {d['name']}", file=sys.stderr)
-        sys.exit(1)
-
-    mic = find_device([
-        "macbook air micro", "macbook pro micro",
-        "built-in micro", "internal micro", "microphone",
-    ], input_only=True)
-
-    if mic is None:
-        default_input = sd.default.device[0]
-        if default_input is not None and default_input != blackhole:
-            mic = default_input
-
-    if mic is None:
-        print("[meeting] No microphone found — recording system audio only", file=sys.stderr)
-
-    bh_name = sd.query_devices(blackhole)["name"]
-    print(f"[meeting] System audio: [{blackhole}] {bh_name}", flush=True)
-    if mic is not None:
-        print(f"[meeting] Microphone:   [{mic}] {sd.query_devices(mic)['name']}", flush=True)
-    return blackhole, mic
-
-
-# -- Audio callbacks ----------------------------------------------------------
-
-def blackhole_callback(indata, frames, time_info, status):
-    if status and "input" not in str(status).lower():
-        print(f"[blackhole] {status}", file=sys.stderr)
-    try:
-        audio_queue.put_nowait(indata.copy())
-    except queue.Full:
-        pass  # drop oldest data rather than OOM
-    if ENABLE_PASSTHROUGH:
-        try:
-            passthrough_queue.put_nowait(indata.copy())
-        except queue.Full:
-            pass
-
-
-def mic_callback(indata, frames, time_info, status):
-    if status:
-        print(f"[mic] {status}", file=sys.stderr)
-    try:
-        mic_queue.put_nowait(indata.copy())
-    except queue.Full:
-        pass
-
-
-# -- Passthrough thread -------------------------------------------------------
-
-def _resample_linear(data: np.ndarray, src_rate: int, dst_rate: int) -> np.ndarray:
-    """Resample audio using linear interpolation."""
-    if src_rate == dst_rate:
-        return data
-    duration = len(data) / src_rate
-    src_time = np.linspace(0, duration, len(data), endpoint=False)
-    dst_samples = int(duration * dst_rate)
-    dst_time = np.linspace(0, duration, dst_samples, endpoint=False)
-    return np.interp(dst_time, src_time, data).astype(np.float32)
-
-
-def passthrough_thread():
-    current_output = None
-    stream = None
-
-    while not shutdown_event.is_set():
-        new_output = find_output_device()
-        if new_output != current_output:
-            if stream is not None:
-                try:
-                    stream.stop()
-                    stream.close()
-                except Exception:
-                    pass
-            current_output = new_output
-            if current_output is not None:
-                try:
-                    dev_info = sd.query_devices(current_output)
-                    out_rate = int(dev_info.get("default_samplerate", PASSTHROUGH_RATE))
-                    stream = sd.OutputStream(
-                        device=current_output, samplerate=out_rate,
-                        channels=1, dtype="float32", blocksize=1024,
-                    )
-                    stream.start()
-                    print(f"[passthrough] Audio -> [{current_output}] {dev_info['name']}", flush=True)
-                except Exception as e:
-                    print(f"[passthrough] Cannot open output: {e}", file=sys.stderr)
-                    stream = None
-
-        try:
-            chunk = passthrough_queue.get(timeout=0.5)
-            if stream is not None:
-                data = chunk.flatten()
-                if stream.samplerate != SAMPLE_RATE:
-                    data = _resample_linear(data, SAMPLE_RATE, int(stream.samplerate))
-                try:
-                    stream.write(data.reshape(-1, 1))
-                except Exception:
-                    pass
-        except queue.Empty:
-            pass
-
-    if stream is not None:
-        try:
-            stream.stop()
-            stream.close()
-        except Exception:
-            pass
-
-
-# -- Transcription ------------------------------------------------------------
-
-def format_time(dt: datetime) -> str:
-    return dt.strftime("%H:%M:%S")
-
+# -- Speaker diarization -----------------------------------------------------
 
 _detected_language = None
 
 
-def transcribe_chunk(model, audio_np: np.ndarray) -> str:
-    global _detected_language
-    segments, info = model.transcribe(
-        audio_np,
-        language=_detected_language,  # None on first chunk → auto-detect, then locked
-        beam_size=5,
-        vad_filter=True,
-        vad_parameters={"min_silence_duration_ms": 500},
-    )
-    text_parts = []
-    for seg in segments:
-        text_parts.append(seg.text.strip())
-    text = " ".join(text_parts).strip()
-
-    # Lock language after first successful detection
-    if _detected_language is None and text and info.language:
-        _detected_language = info.language
-        print(f"[meeting] Language detected: {info.language} (probability: {info.language_probability:.2f})", flush=True)
-
-    return text
-
-
-def _drain_queue(q: queue.Queue) -> list:
-    """Drain all available items from a queue without blocking."""
-    items = []
-    while True:
-        try:
-            items.append(q.get_nowait())
-        except queue.Empty:
-            break
-    return items
-
-
-def _write_transcript(path: Path, line: str):
-    """Write a line to the transcript file with error handling."""
-    try:
-        with open(path, "a", encoding="utf-8") as f:
-            f.write(line)
-            f.flush()
-            os.fsync(f.fileno())
-    except OSError as e:
-        print(f"[meeting] WRITE ERROR: {e}", file=sys.stderr, flush=True)
-        raise
-
-
 def _classify_speakers(audio_bh: np.ndarray, audio_mic: np.ndarray,
                        frame_ms: int = 500) -> list[tuple[str, int, int]]:
-    """Classify [You] vs [Remote] using energy ratio between the two channels.
-
-    BlackHole has ONLY remote audio (virtual device, no bleed).
-    Microphone has local speaker + some room bleed of remote audio.
-    When local speaker talks, mic energy >> bh energy.
-    When remote speaks, bh energy is high and mic picks up attenuated bleed.
-    """
+    """Classify [You] vs [Remote] using energy ratio between the two channels."""
     frame_size = int(SAMPLE_RATE * frame_ms / 1000)
     segments = []
     silence_threshold = 0.005
@@ -262,7 +69,6 @@ def _classify_speakers(audio_bh: np.ndarray, audio_mic: np.ndarray,
         speaker = "[You]" if ratio > 2.5 else "[Remote]"
         segments.append((speaker, i, i + frame_size))
 
-    # Merge consecutive same-speaker segments
     if not segments:
         return []
     merged = [segments[0]]
@@ -276,18 +82,12 @@ def _classify_speakers(audio_bh: np.ndarray, audio_mic: np.ndarray,
 
 def _build_diarized_text(text: str, segments: list[tuple[str, int, int]],
                          audio_len: int) -> str:
-    """Prepend dominant speaker label to transcribed text."""
     if not segments:
         return text
-
-    # Find the speaker who talked most in this chunk
     speaker_time = {}
     for speaker, start, end in segments:
         speaker_time[speaker] = speaker_time.get(speaker, 0) + (end - start)
-
     dominant = max(speaker_time, key=speaker_time.get)
-
-    # If both speakers talked, show transitions
     if len(speaker_time) > 1:
         total = sum(speaker_time.values())
         you_pct = speaker_time.get("[You]", 0) / total
@@ -297,12 +97,58 @@ def _build_diarized_text(text: str, segments: list[tuple[str, int, int]],
             return f"[Remote] {text}"
         else:
             return f"[You + Remote] {text}"
-
     return f"{dominant} {text}"
 
 
+# -- Transcription ------------------------------------------------------------
+
+def format_time(dt: datetime) -> str:
+    return dt.strftime("%H:%M:%S")
+
+
+def transcribe_chunk(model, audio_np: np.ndarray) -> str:
+    global _detected_language
+    segments, info = model.transcribe(
+        audio_np,
+        language=_detected_language,
+        beam_size=5,
+        vad_filter=True,
+        vad_parameters={"min_silence_duration_ms": 500},
+    )
+    text_parts = []
+    for seg in segments:
+        text_parts.append(seg.text.strip())
+    text = " ".join(text_parts).strip()
+
+    if _detected_language is None and text and info.language:
+        _detected_language = info.language
+        print(f"[meeting] Language detected: {info.language} (probability: {info.language_probability:.2f})", flush=True)
+
+    return text
+
+
+def _drain_queue(q: queue.Queue) -> list:
+    items = []
+    while True:
+        try:
+            items.append(q.get_nowait())
+        except queue.Empty:
+            break
+    return items
+
+
+def _write_transcript(path: Path, line: str):
+    try:
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(line)
+            f.flush()
+            os.fsync(f.fileno())
+    except OSError as e:
+        print(f"[meeting] WRITE ERROR: {e}", file=sys.stderr, flush=True)
+        raise
+
+
 def _touch_heartbeat(path: Path):
-    """Touch file mtime so server.py knows we're alive even during silence."""
     try:
         path.touch()
     except Exception:
@@ -319,7 +165,6 @@ def writer_thread(model, has_mic: bool):
 
     try:
         while not shutdown_event.is_set() or not audio_queue.empty() or not mic_queue.empty():
-            # Drain both queues each iteration to prevent drift
             bh_chunks = _drain_queue(audio_queue)
             if not bh_chunks:
                 try:
@@ -354,14 +199,12 @@ def writer_thread(model, has_mic: bool):
                 text = transcribe_chunk(model, audio_mixed)
 
                 if text:
-                    # Speaker diarization: label [You] vs [Remote] using pre-mix channels
-                    # Use padded arrays so both channels have equal length
                     if ENABLE_DIARIZATION and audio_mic_raw is not None:
                         try:
                             segments = _classify_speakers(audio_bh_padded, audio_mic_padded)
                             text = _build_diarized_text(text, segments, len(audio_bh_padded))
                         except Exception:
-                            pass  # fall back to unlabeled text
+                            pass
                     line = f"[{format_time(chunk_start)}-{format_time(chunk_end)}] {text}\n"
                     _write_transcript(TRANSCRIPT_FILE, line)
                     print(f"[meeting] -> {text[:80]}...", flush=True)
@@ -372,13 +215,11 @@ def writer_thread(model, has_mic: bool):
                 last_heartbeat = time.time()
                 chunk_start = chunk_end
             else:
-                # Heartbeat during silence — touch file every 60s so server.py
-                # doesn't show "recording not active" during quiet periods
                 if time.time() - last_heartbeat > 60:
                     _touch_heartbeat(TRANSCRIPT_FILE)
                     last_heartbeat = time.time()
 
-        # Flush remaining buffers (both bh and mic)
+        # Flush remaining
         if buffer_bh:
             audio = np.concatenate(buffer_bh).flatten().astype(np.float32)
             flush_mic_padded = None
@@ -407,39 +248,148 @@ def writer_thread(model, has_mic: bool):
         shutdown_event.set()
 
 
+# -- CoreAudio Tap reader (reads PCM from process-audio-tap stdout) -----------
+
+def tap_reader_thread(proc: subprocess.Popen):
+    """Read raw PCM (16-bit LE, 16kHz, mono) from tap subprocess stdout."""
+    BYTES_PER_SAMPLE = 2
+    CHUNK_SAMPLES = SAMPLE_RATE  # 1 second chunks
+    CHUNK_BYTES = CHUNK_SAMPLES * BYTES_PER_SAMPLE
+
+    try:
+        while not shutdown_event.is_set():
+            data = proc.stdout.read(CHUNK_BYTES)
+            if not data:
+                print("[meeting] Tap process ended", flush=True)
+                shutdown_event.set()
+                break
+            audio = np.frombuffer(data, dtype=np.int16).astype(np.float32) / 32768.0
+            try:
+                audio_queue.put_nowait(audio)
+            except queue.Full:
+                pass  # drop if whisper falls behind
+    except Exception as e:
+        print(f"[meeting] Tap reader error: {e}", file=sys.stderr, flush=True)
+        shutdown_event.set()
+
+
+# -- Mic reader (sounddevice, for [You] labels) -------------------------------
+
+def start_mic_stream():
+    """Start microphone capture via sounddevice for speaker diarization."""
+    try:
+        import sounddevice as sd
+
+        def find_mic() -> int | None:
+            for name in ["macbook air micro", "macbook pro micro",
+                          "built-in micro", "internal micro", "microphone"]:
+                for i, d in enumerate(sd.query_devices()):
+                    if d["max_input_channels"] > 0 and name in d["name"].lower():
+                        return i
+            default = sd.default.device[0]
+            if default is not None:
+                return default
+            return None
+
+        mic = find_mic()
+        if mic is None:
+            print("[meeting] No microphone found — recording remote audio only", file=sys.stderr)
+            return None
+
+        def mic_callback(indata, frames, time_info, status):
+            if status:
+                print(f"[mic] {status}", file=sys.stderr)
+            try:
+                mic_queue.put_nowait(indata.copy())
+            except queue.Full:
+                pass
+
+        stream = sd.InputStream(
+            device=mic, samplerate=SAMPLE_RATE, channels=1,
+            dtype="float32", callback=mic_callback, blocksize=SAMPLE_RATE,
+        )
+        stream.start()
+        print(f"[meeting] Microphone: [{mic}] {sd.query_devices(mic)['name']}", flush=True)
+        return stream
+
+    except Exception as e:
+        print(f"[meeting] Mic init failed: {e}", file=sys.stderr)
+        return None
+
+
 # -- Main --------------------------------------------------------------------
 
 def main():
-    blackhole_device, mic_device = detect_devices()
-    has_mic = mic_device is not None
-
     TRANSCRIPT_FILE.parent.mkdir(parents=True, exist_ok=True)
 
-    # Write header and start audio BEFORE loading model to capture early audio
     now = datetime.now()
     with open(TRANSCRIPT_FILE, "a", encoding="utf-8") as f:
         f.write(f"\n{'='*60}\nMeeting started: {now.strftime('%Y-%m-%d %H:%M')}\n{'='*60}\n")
 
-    # Start audio capture FIRST so we buffer audio while model loads
-    streams = []
-    try:
-        streams.append(sd.InputStream(
-            device=blackhole_device, samplerate=SAMPLE_RATE, channels=CHANNELS,
-            dtype="float32", callback=blackhole_callback, blocksize=SAMPLE_RATE,
-        ))
-        if has_mic:
-            streams.append(sd.InputStream(
-                device=mic_device, samplerate=SAMPLE_RATE, channels=1,
-                dtype="float32", callback=mic_callback, blocksize=SAMPLE_RATE,
-            ))
-        for s in streams:
-            s.start()
-        print("[meeting] Audio streams started, buffering...", flush=True)
-    except Exception as e:
-        print(f"[meeting] Failed to open audio device: {e}", file=sys.stderr)
-        sys.exit(1)
+    # Determine capture mode
+    use_tap = (CAPTURE_MODE == "coreaudio" and AUDIO_TAP_BIN.exists())
 
-    # Now load model — audio is being buffered in the queues meanwhile
+    if use_tap:
+        print(f"[meeting] CoreAudio Tap mode — capturing {BUNDLE_ID}", flush=True)
+
+        # Start tap subprocess
+        tap_proc = subprocess.Popen(
+            [str(AUDIO_TAP_BIN), "--bundle-id", BUNDLE_ID],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+
+        # Stream tap stderr to our stderr
+        def tap_stderr():
+            for line in tap_proc.stderr:
+                print(f"[tap] {line.decode(errors='replace').rstrip()}", file=sys.stderr, flush=True)
+        threading.Thread(target=tap_stderr, daemon=True).start()
+
+        # Start tap reader thread (fills audio_queue)
+        tap_thread = threading.Thread(target=tap_reader_thread, args=(tap_proc,), daemon=True)
+        tap_thread.start()
+
+    else:
+        print("[meeting] Legacy mode — using BlackHole + sounddevice", flush=True)
+        import sounddevice as sd
+
+        def find_device(patterns):
+            for i, d in enumerate(sd.query_devices()):
+                if d["max_input_channels"] == 0:
+                    continue
+                for p in patterns:
+                    if p.lower() in d["name"].lower():
+                        return i
+            return None
+
+        blackhole = find_device(["blackhole 2ch", "blackhole"])
+        if blackhole is None:
+            print("[meeting] BlackHole not found!", file=sys.stderr)
+            sys.exit(1)
+
+        def bh_callback(indata, frames, time_info, status):
+            try:
+                audio_queue.put_nowait(indata.copy())
+            except queue.Full:
+                pass
+
+        bh_stream = sd.InputStream(
+            device=blackhole, samplerate=SAMPLE_RATE, channels=CHANNELS,
+            dtype="float32", callback=bh_callback, blocksize=SAMPLE_RATE,
+        )
+        bh_stream.start()
+        print(f"[meeting] BlackHole: [{blackhole}] {sd.query_devices(blackhole)['name']}", flush=True)
+        tap_proc = None
+
+    # Start mic (for speaker labels)
+    mic_stream = None
+    has_mic = False
+    if ENABLE_DIARIZATION:
+        mic_stream = start_mic_stream()
+        has_mic = mic_stream is not None
+
+    # Load Whisper model
+    from faster_whisper import WhisperModel
     print(f"[meeting] Loading Whisper model '{MODEL_SIZE}'...", flush=True)
     model = WhisperModel(MODEL_SIZE, device="cpu", compute_type="int8")
     print("[meeting] Model ready.", flush=True)
@@ -450,13 +400,7 @@ def main():
     signal.signal(signal.SIGINT, handle_signal)
     signal.signal(signal.SIGTERM, handle_signal)
 
-    if ENABLE_PASSTHROUGH:
-        out_dev = find_output_device()
-        if out_dev is not None:
-            print(f"[meeting] Passthrough: Zoom audio -> {sd.query_devices(out_dev)['name']}", flush=True)
-        pt = threading.Thread(target=passthrough_thread, daemon=True)
-        pt.start()
-
+    # Start writer thread
     wt = threading.Thread(target=writer_thread, args=(model, has_mic), daemon=False)
     wt.start()
 
@@ -466,12 +410,31 @@ def main():
             shutdown_event.wait(timeout=0.5)
     finally:
         shutdown_event.set()
-        for s in streams:
+
+        # Stop tap process
+        if tap_proc and tap_proc.poll() is None:
+            tap_proc.terminate()
             try:
-                s.stop()
-                s.close()
+                tap_proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                tap_proc.kill()
+
+        # Stop mic stream
+        if mic_stream:
+            try:
+                mic_stream.stop()
+                mic_stream.close()
             except Exception:
                 pass
+
+        # Stop legacy blackhole stream
+        if not use_tap and 'bh_stream' in dir():
+            try:
+                bh_stream.stop()
+                bh_stream.close()
+            except Exception:
+                pass
+
         wt.join(timeout=60)
 
     if error_event.is_set():
