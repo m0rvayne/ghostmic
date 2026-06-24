@@ -303,20 +303,31 @@ _zoom_muted = False
 
 
 def _check_zoom_mute() -> bool:
-    """Check if Zoom mic is muted via AppleScript menu inspection."""
+    """Check if Zoom mic is muted via AppleScript menu inspection.
+    Supports English and Russian Zoom UI."""
     try:
         r = subprocess.run(
             ["osascript", "-e", '''tell application "System Events"
     tell process "zoom.us"
-        if exists (menu bar item "Meeting" of menu bar 1) then
-            if exists (menu item "Unmute Audio" of menu 1 of menu bar item "Meeting" of menu bar 1) then
-                return "muted"
-            else
-                return "unmuted"
+        set menuNames to name of every menu bar item of menu bar 1
+        -- Find the meeting menu (English: "Meeting", Russian: "Конференция")
+        set meetingMenu to missing value
+        repeat with m in menuNames
+            if m is "Meeting" or m is "Конференция" then
+                set meetingMenu to m
+                exit repeat
             end if
-        else
-            return "no-meeting"
-        end if
+        end repeat
+        if meetingMenu is missing value then return "no-meeting"
+
+        set items to name of every menu item of menu 1 of menu bar item meetingMenu of menu bar 1
+        -- Check for unmute item (EN: "Unmute Audio", RU: "Включить звук")
+        repeat with item in items
+            if item is "Unmute Audio" or item is "Включить звук" then
+                return "muted"
+            end if
+        end repeat
+        return "unmuted"
     end tell
 end tell'''],
             capture_output=True, text=True, timeout=3
