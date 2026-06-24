@@ -180,6 +180,10 @@ def writer_thread(model, has_mic: bool):
 
             if total_bh >= SAMPLE_RATE * CHUNK_SECONDS:
                 audio_bh = np.concatenate(buffer_bh).flatten().astype(np.float32)
+                # Cap at exactly CHUNK_SECONDS to prevent Whisper from getting 60+ seconds
+                max_samples = SAMPLE_RATE * CHUNK_SECONDS
+                if len(audio_bh) > max_samples:
+                    audio_bh = audio_bh[:max_samples]
                 audio_mic_raw = None
 
                 if has_mic and buffer_mic:
