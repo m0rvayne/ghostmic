@@ -25,7 +25,7 @@ import numpy as np
 
 SAMPLE_RATE = 16000
 CHANNELS = 1
-CHUNK_SECONDS = 30
+CHUNK_SECONDS = 15
 MAX_QUEUE_CHUNKS = 240  # ~4 min of audio in queue items
 _DEFAULT_TRANSCRIPT = Path(__file__).parent / "transcripts" / "meeting_transcript.txt"
 TRANSCRIPT_FILE = Path(os.environ.get("TRANSCRIPT_FILE", _DEFAULT_TRANSCRIPT))
