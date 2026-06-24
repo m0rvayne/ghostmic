@@ -123,9 +123,11 @@ def transcribe_chunk(model, audio_np: np.ndarray) -> str:
         text_parts.append(seg.text.strip())
     text = " ".join(text_parts).strip()
 
-    if _detected_language is None and text and info.language:
+    if _detected_language is None and text and info.language and info.language_probability > 0.7:
         _detected_language = info.language
-        print(f"[meeting] Language detected: {info.language} (probability: {info.language_probability:.2f})", flush=True)
+        print(f"[meeting] Language locked: {info.language} (probability: {info.language_probability:.2f})", flush=True)
+    elif _detected_language is None and text and info.language:
+        print(f"[meeting] Language guess: {info.language} (probability: {info.language_probability:.2f}) — too low to lock", flush=True)
 
     return text
 
