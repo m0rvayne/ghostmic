@@ -116,55 +116,48 @@ def transcribe_chunk(model_unused, audio_np: np.ndarray) -> str:
     """Transcribe audio using whisper.cpp CLI with Metal GPU acceleration."""
     lang = LANGUAGE if LANGUAGE != "auto" else "auto"
 
-    # Convert float32 audio to int16 WAV via ffmpeg
+    import tempfile
+
+    # Convert float32 audio to int16 PCM
     pcm_data = (audio_np * 32768).astype(np.int16).tobytes()
 
-    # ffmpeg: raw PCM → WAV on stdout, pipe to whisper-cli
-    ffmpeg_cmd = [
-        "ffmpeg", "-f", "s16le", "-ar", "16000", "-ac", "1",
-        "-i", "pipe:0", "-f", "wav", "pipe:1"
-    ]
-    whisper_cmd = [
-        WHISPER_CLI,
-        "-m", WHISPER_MODEL_PATH,
-        "-f", "-",
-        "--no-timestamps",
-        "-t", "4",
-    ]
-    if lang != "auto":
-        whisper_cmd.extend(["-l", lang])
+    # Write to temp WAV file (whisper-cli can't read WAV from stdin pipe)
+    tmp_wav = os.path.join(tempfile.gettempdir(), "ghostmic-chunk.wav")
 
     try:
-        # ffmpeg converts PCM→WAV, pipes to whisper-cli
-        ffmpeg_proc = subprocess.Popen(
-            ffmpeg_cmd,
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
+        # PCM → WAV via ffmpeg
+        subprocess.run(
+            ["ffmpeg", "-y", "-f", "s16le", "-ar", "16000", "-ac", "1", "-i", "pipe:0", tmp_wav],
+            input=pcm_data, capture_output=True, timeout=10,
         )
-        whisper_proc = subprocess.Popen(
-            whisper_cmd,
-            stdin=ffmpeg_proc.stdout,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-        )
-        ffmpeg_proc.stdout.close()
-        ffmpeg_proc.stdin.write(pcm_data)
-        ffmpeg_proc.stdin.close()
 
-        output, _ = whisper_proc.communicate(timeout=30)
-        text = output.decode("utf-8", errors="replace").strip()
+        # Transcribe WAV file
+        whisper_cmd = [
+            WHISPER_CLI,
+            "-m", WHISPER_MODEL_PATH,
+            "-f", tmp_wav,
+            "--no-timestamps",
+            "-t", "4",
+        ]
+        if lang != "auto":
+            whisper_cmd.extend(["-l", lang])
 
-        # whisper-cli outputs with leading whitespace and [BLANK_AUDIO] markers
+        r = subprocess.run(whisper_cmd, capture_output=True, timeout=30)
+        text = r.stdout.decode("utf-8", errors="replace").strip()
+
+        # Clean up whisper output
         text = text.replace("[BLANK_AUDIO]", "").strip()
-
-        # Remove any SRT-like timestamp lines that might leak through
         lines = [l.strip() for l in text.split("\n") if l.strip() and not l.strip().startswith("[")]
         text = " ".join(lines).strip()
 
     except Exception as e:
         print(f"[meeting] Transcription error: {e}", file=sys.stderr, flush=True)
         text = ""
+    finally:
+        try:
+            os.unlink(tmp_wav)
+        except OSError:
+            pass
 
     return text
 
@@ -241,7 +234,9 @@ def writer_thread(model, has_mic: bool):
                 buffer_mic = []
                 chunk_end = datetime.now()
 
-                print(f"[meeting] Transcribing {format_time(chunk_start)}-{format_time(chunk_end)}...", flush=True)
+                rms = np.sqrt(np.mean(audio_mixed ** 2))
+                nonzero = np.count_nonzero(audio_mixed)
+                print(f"[meeting] Transcribing {format_time(chunk_start)}-{format_time(chunk_end)} (samples={len(audio_mixed)}, RMS={rms:.4f}, nonzero={nonzero})...", flush=True)
                 text = transcribe_chunk(model, audio_mixed)
 
                 if text:
