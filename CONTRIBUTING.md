@@ -17,7 +17,8 @@ python3 -m venv .test-venv
 ```bash
 .test-venv/bin/pytest -v          # Python tests (86 tests)
 bash -n install.sh                # Shell syntax check
-swiftc create-multi-output.swift -framework CoreAudio -framework CoreFoundation -o /tmp/test-build  # Swift build
+swiftc -O -framework CoreAudio -framework AudioToolbox -framework AppKit process-audio-tap.swift -o /tmp/test-tap  # Swift audio tap
+swiftc -O -framework AppKit statusbar.swift -o /tmp/test-statusbar  # Swift menu bar
 ```
 
 ## Code style

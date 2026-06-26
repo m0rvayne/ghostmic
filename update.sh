@@ -57,8 +57,8 @@ else
             say "Rebuilding menu bar indicator..."
             swiftc -O -framework AppKit "$INSTALL_DIR/statusbar.swift" -o "$INSTALL_DIR/.build/statusbar" 2>/dev/null && ok "Menu bar rebuilt"
         fi
-        if [[ -f "$INSTALL_DIR/create-multi-output.swift" ]]; then
-            swiftc -O -framework CoreAudio -framework CoreFoundation "$INSTALL_DIR/create-multi-output.swift" -o "$INSTALL_DIR/.build/create-multi-output" 2>/dev/null
+        if [[ -f "$INSTALL_DIR/process-audio-tap.swift" ]]; then
+            swiftc -O -framework CoreAudio -framework AudioToolbox -framework AppKit "$INSTALL_DIR/process-audio-tap.swift" -o "$INSTALL_DIR/.build/process-audio-tap" 2>/dev/null && ok "Audio tap rebuilt"
         fi
     fi
 

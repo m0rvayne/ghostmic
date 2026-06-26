@@ -3,8 +3,7 @@ set -euo pipefail
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # ghostmic — One-command installer
-# Live Zoom transcription: BlackHole -> Whisper AI -> text
-# Audio passthrough: hear Zoom through speakers/headphones, auto headphone switch
+# Silent Zoom transcription: CoreAudio Tap -> whisper.cpp -> Qwen3 LLM -> Claude
 # ═══════════════════════════════════════════════════════════════════════════════
 
 INSTALL_DIR="$HOME/.ghostmic"
@@ -131,26 +130,34 @@ $PYTHON -m venv "$INSTALL_DIR/.venv"
 "$INSTALL_DIR/.venv/bin/pip" install -q -r "$INSTALL_DIR/requirements.txt"
 ok "Dependencies installed"
 
-# ── 7. Whisper model ─────────────────────────────────────────────────────────
-say "Downloading Whisper AI model 'small' (~500MB, one-time)..."
-say "This may take 3-7 minutes depending on internet speed..."
-if ! "$INSTALL_DIR/.venv/bin/python3" -c "
-import sys, os
-os.environ['HF_HUB_DISABLE_PROGRESS_BARS'] = '0'
-from faster_whisper import WhisperModel
-print('  Downloading model files...', flush=True)
-WhisperModel('small', device='cpu', compute_type='int8')
-print('  Done.', flush=True)
-" 2>&1; then
-    err "Whisper model download failed."
-    err "Check disk space (need ~1.5GB) and internet connection."
-    err "Retry manually: $INSTALL_DIR/.venv/bin/python3 -c \"from faster_whisper import WhisperModel; WhisperModel('small', device='cpu', compute_type='int8')\""
-    exit 1
+# ── 7. whisper.cpp (brew) ────────────────────────────────────────────────────
+say "Checking whisper.cpp..."
+if command -v whisper-cli &>/dev/null; then
+    ok "whisper-cli already installed"
+else
+    say "Installing whisper.cpp..."
+    brew install whisper-cpp
+    ok "whisper-cli installed"
 fi
-ok "Whisper model ready"
 
-# ── 8. Audio setup — not needed with CoreAudio Taps ─────────────────────────
-ok "No audio routing setup needed — CoreAudio captures Zoom directly"
+# ── 7b. Whisper model (ggml) ────────────────────────────────────────────────
+WHISPER_MODEL="$INSTALL_DIR/models/ggml-large-v3-turbo.bin"
+if [[ -f "$WHISPER_MODEL" ]]; then
+    ok "Whisper model ready (large-v3-turbo)"
+else
+    say "Downloading whisper model 'large-v3-turbo' (~1.5GB, one-time)..."
+    mkdir -p "$INSTALL_DIR/models"
+    if curl -L --progress-bar -o "$WHISPER_MODEL" \
+        https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3-turbo.bin; then
+        ok "Whisper model ready"
+    else
+        err "Model download failed. Check disk space (~2GB needed) and internet."
+        exit 1
+    fi
+fi
+
+# ── 8. No audio setup needed ────────────────────────────────────────────────
+ok "CoreAudio Process Taps — no audio routing setup needed"
 
 # ── 9. Claude Desktop config ────────────────────────────────────────────────
 say "Configuring Claude Desktop..."

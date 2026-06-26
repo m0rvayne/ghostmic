@@ -81,13 +81,11 @@ fi
 cat << 'DONE'
 
   ╔═══════════════════════════════════════════════════╗
-  ║         ✅ Meeting Transcript Uninstalled           ║
+  ║         ✅ ghostmic Uninstalled                     ║
   ╚═══════════════════════════════════════════════════╝
 
   What was NOT removed (used by other apps):
-  - BlackHole 2ch (brew uninstall blackhole-2ch)
-  - "Zoom + Transcript" device (remove in Audio MIDI Setup)
-  - Whisper model cache (~/.cache/huggingface/)
+  - whisper-cpp (brew uninstall whisper-cpp)
 
   Restart Claude Desktop (Cmd+Q) to apply config changes.
 

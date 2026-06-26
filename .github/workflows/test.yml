@@ -18,7 +18,7 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
       - run: pip install -e ".[test]"
-      - run: pytest tests/test_server.py tests/test_capture.py tests/test_watcher.py -v
+      - run: pytest tests/test_server.py tests/test_watcher.py -v
 
   integration-tests:
     runs-on: ubuntu-latest
@@ -34,11 +34,11 @@ jobs:
     runs-on: macos-15
     steps:
       - uses: actions/checkout@v4
-      - run: swiftc -framework CoreAudio -framework CoreFoundation create-multi-output.swift -o create-multi-output
-      - run: ./create-multi-output list
+      - run: swiftc -O -framework CoreAudio -framework AudioToolbox -framework AppKit process-audio-tap.swift -o process-audio-tap
+      - run: swiftc -O -framework AppKit statusbar.swift -o statusbar
 
   shell-syntax:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - run: bash -n install.sh && bash -n setup-audio.sh && bash -n update.sh && bash -n uninstall.sh
+      - run: bash -n install.sh && bash -n update.sh && bash -n uninstall.sh
