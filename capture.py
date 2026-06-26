@@ -112,8 +112,40 @@ def format_time(dt: datetime) -> str:
     return dt.strftime("%H:%M:%S")
 
 
+# Known Whisper hallucination patterns (appears on silence/quiet audio)
+_HALLUCINATION_PATTERNS = [
+    "продолжение следует", "субтитры сделал", "спасибо за просмотр",
+    "подписывайтесь на канал", "ставьте лайк", "до новых встреч",
+    "редактор субтитров", "корректор", "thanks for watching",
+    "subscribe", "like and subscribe", "see you next time",
+    "please subscribe", "thank you for watching",
+]
+
+MIN_SPEECH_RMS = 0.01  # below this = silence, skip transcription
+
+
+def _is_hallucination(text: str) -> bool:
+    """Check if text is a known Whisper hallucination."""
+    lower = text.lower().strip()
+    if len(lower) < 3:
+        return True  # single letters, dots
+    if lower in ("и", "а", "...", "–", "-", "."):
+        return True
+    if all(c in ".-… " for c in lower):
+        return True
+    for pattern in _HALLUCINATION_PATTERNS:
+        if pattern in lower:
+            return True
+    return False
+
+
 def transcribe_chunk(model_unused, audio_np: np.ndarray) -> str:
     """Transcribe audio using whisper.cpp CLI with Metal GPU acceleration."""
+    # Skip very quiet audio — prevents hallucinations on silence
+    rms = np.sqrt(np.mean(audio_np ** 2))
+    if rms < MIN_SPEECH_RMS:
+        return ""
+
     lang = LANGUAGE if LANGUAGE != "auto" else "auto"
 
     import tempfile
@@ -149,6 +181,10 @@ def transcribe_chunk(model_unused, audio_np: np.ndarray) -> str:
         text = text.replace("[BLANK_AUDIO]", "").strip()
         lines = [l.strip() for l in text.split("\n") if l.strip() and not l.strip().startswith("[")]
         text = " ".join(lines).strip()
+
+        # Filter hallucinations
+        if _is_hallucination(text):
+            text = ""
 
     except Exception as e:
         print(f"[meeting] Transcription error: {e}", file=sys.stderr, flush=True)
