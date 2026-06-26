@@ -25,7 +25,7 @@ import numpy as np
 
 SAMPLE_RATE = 16000
 CHANNELS = 1
-CHUNK_SECONDS = 10
+CHUNK_SECONDS = 5
 MAX_QUEUE_CHUNKS = 240  # ~4 min of audio in queue items
 _DEFAULT_TRANSCRIPT = Path(__file__).parent / "transcripts" / "meeting_transcript.txt"
 TRANSCRIPT_FILE = Path(os.environ.get("TRANSCRIPT_FILE", _DEFAULT_TRANSCRIPT))
@@ -250,24 +250,27 @@ def writer_thread(model, has_mic: bool):
             total_bh = sum(len(d) for d in buffer_bh)
 
             if total_bh >= SAMPLE_RATE * CHUNK_SECONDS:
-                audio_bh = np.concatenate(buffer_bh).flatten().astype(np.float32)
-                # Cap at exactly CHUNK_SECONDS to prevent Whisper from getting 60+ seconds
+                all_bh = np.concatenate(buffer_bh).flatten().astype(np.float32)
                 max_samples = SAMPLE_RATE * CHUNK_SECONDS
-                if len(audio_bh) > max_samples:
-                    audio_bh = audio_bh[:max_samples]
-                audio_mic_raw = None
 
+                # Take exactly CHUNK_SECONDS, keep remainder for next iteration
+                audio_bh = all_bh[:max_samples]
+                remainder_bh = all_bh[max_samples:]
+                buffer_bh = [remainder_bh] if len(remainder_bh) > 0 else []
+
+                audio_mic_raw = None
                 if has_mic and buffer_mic:
-                    audio_mic_raw = np.concatenate(buffer_mic).flatten().astype(np.float32)
+                    all_mic = np.concatenate(buffer_mic).flatten().astype(np.float32)
+                    audio_mic_raw = all_mic[:max_samples]
+                    remainder_mic = all_mic[max_samples:]
+                    buffer_mic = [remainder_mic] if len(remainder_mic) > 0 else []
                     max_len = max(len(audio_bh), len(audio_mic_raw))
                     audio_bh_padded = np.pad(audio_bh, (0, max(0, max_len - len(audio_bh))))
                     audio_mic_padded = np.pad(audio_mic_raw, (0, max(0, max_len - len(audio_mic_raw))))
                     audio_mixed = np.clip((audio_bh_padded + audio_mic_padded) * 0.5, -1.0, 1.0)
                 else:
                     audio_mixed = audio_bh
-
-                buffer_bh = []
-                buffer_mic = []
+                    buffer_mic = []
                 chunk_end = datetime.now()
 
                 rms = np.sqrt(np.mean(audio_mixed ** 2))
