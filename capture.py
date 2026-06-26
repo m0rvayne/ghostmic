@@ -247,10 +247,10 @@ def writer_thread(model, has_mic: bool):
             if has_mic:
                 buffer_mic.extend(_drain_queue(mic_queue))
 
-            total_bh = sum(len(d) for d in buffer_bh)
+            total_bh = sum(d.size for d in buffer_bh)
 
             if total_bh >= SAMPLE_RATE * CHUNK_SECONDS:
-                all_bh = np.concatenate(buffer_bh).flatten().astype(np.float32)
+                all_bh = np.concatenate([b.flatten() for b in buffer_bh]).astype(np.float32)
                 max_samples = SAMPLE_RATE * CHUNK_SECONDS
 
                 # Take exactly CHUNK_SECONDS, keep remainder for next iteration
@@ -260,7 +260,7 @@ def writer_thread(model, has_mic: bool):
 
                 audio_mic_raw = None
                 if has_mic and buffer_mic:
-                    all_mic = np.concatenate(buffer_mic).flatten().astype(np.float32)
+                    all_mic = np.concatenate([b.flatten() for b in buffer_mic]).astype(np.float32)
                     audio_mic_raw = all_mic[:max_samples]
                     remainder_mic = all_mic[max_samples:]
                     buffer_mic = [remainder_mic] if len(remainder_mic) > 0 else []
