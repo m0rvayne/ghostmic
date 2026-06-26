@@ -250,20 +250,13 @@ def writer_thread(model, has_mic: bool):
             total_bh = sum(d.size for d in buffer_bh)
 
             if total_bh >= SAMPLE_RATE * CHUNK_SECONDS:
-                all_bh = np.concatenate([b.flatten() for b in buffer_bh]).astype(np.float32)
-                max_samples = SAMPLE_RATE * CHUNK_SECONDS
-
-                # Take exactly CHUNK_SECONDS, keep remainder for next iteration
-                audio_bh = all_bh[:max_samples]
-                remainder_bh = all_bh[max_samples:]
-                buffer_bh = [remainder_bh] if len(remainder_bh) > 0 else []
+                audio_bh = np.concatenate([b.flatten() for b in buffer_bh]).astype(np.float32)
+                buffer_bh = []
 
                 audio_mic_raw = None
                 if has_mic and buffer_mic:
-                    all_mic = np.concatenate([b.flatten() for b in buffer_mic]).astype(np.float32)
-                    audio_mic_raw = all_mic[:max_samples]
-                    remainder_mic = all_mic[max_samples:]
-                    buffer_mic = [remainder_mic] if len(remainder_mic) > 0 else []
+                    audio_mic_raw = np.concatenate([b.flatten() for b in buffer_mic]).astype(np.float32)
+                    buffer_mic = []
                     max_len = max(len(audio_bh), len(audio_mic_raw))
                     audio_bh_padded = np.pad(audio_bh, (0, max(0, max_len - len(audio_bh))))
                     audio_mic_padded = np.pad(audio_mic_raw, (0, max(0, max_len - len(audio_mic_raw))))
