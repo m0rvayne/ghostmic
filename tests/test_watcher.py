@@ -1,9 +1,10 @@
 """Tests for watcher.py — state machine, process management, detection."""
+import json
 import os
 import signal
 import time
 from pathlib import Path
-from unittest.mock import patch, MagicMock
+from unittest.mock import patch, MagicMock, call
 import pytest
 import importlib.util
 
@@ -41,6 +42,16 @@ def config(tmp_path):
 @pytest.fixture
 def ctx(config):
     return watcher.WatcherContext(config=config)
+
+
+def _mock_popen():
+    """Create a MagicMock that behaves like a running subprocess.Popen."""
+    proc = MagicMock()
+    proc.poll.return_value = None  # process is running
+    proc.stdout = iter([])
+    proc.returncode = None
+    proc.wait.return_value = 0
+    return proc
 
 
 class TestAtomicSymlink:
@@ -139,14 +150,12 @@ class TestZoomDetection:
 class TestStatusFile:
     def test_write_status_recording(self, config):
         watcher.write_status(config, "RECORDING", "test.txt")
-        import json
         status = json.loads((config.install_dir / "watcher-status.json").read_text())
         assert status["state"] == "RECORDING"
         assert status["transcript"] == "test.txt"
 
     def test_write_status_idle(self, config):
         watcher.write_status(config, "IDLE")
-        import json
         status = json.loads((config.install_dir / "watcher-status.json").read_text())
         assert status["state"] == "IDLE"
         assert "transcript" not in status
@@ -171,3 +180,194 @@ class TestTickStateMachine:
         with patch.object(watcher, "is_in_conference", side_effect=RuntimeError("oops")):
             watcher.tick(ctx)  # should not raise
         assert ctx.state == watcher.State.IDLE
+
+
+class TestTickSequences:
+    """Multi-tick state machine scenarios exercising full transitions."""
+
+    def test_idle_detect_conference_starts_recording(self, ctx):
+        """IDLE -> detect conference -> RECORDING, verify start_capture called."""
+        with patch.object(watcher, "is_in_conference", return_value=True), \
+             patch.object(watcher, "start_capture") as mock_start:
+            watcher.tick(ctx)
+        mock_start.assert_called_once_with(ctx)
+
+    def test_recording_conference_gone_grace_timeout_idle(self, ctx):
+        """RECORDING -> conference gone -> GRACE_PERIOD -> timeout -> IDLE."""
+        proc = _mock_popen()
+        ctx.capture_process = proc
+        ctx.state = watcher.State.RECORDING
+        ctx.current_transcript = ctx.config.transcripts_dir / "test.txt"
+        ctx.current_transcript.touch()
+
+        # Tick 1: conference gone -> enter grace period
+        with patch.object(watcher, "is_in_conference", return_value=False):
+            watcher.tick(ctx)
+        assert ctx.state == watcher.State.GRACE_PERIOD
+        assert ctx.grace_start is not None
+
+        # Simulate grace period elapsed
+        ctx.grace_start = time.time() - ctx.config.grace_period - 1
+
+        # Tick 2: still no conference, grace expired -> stop capture
+        with patch.object(watcher, "is_in_conference", return_value=False):
+            watcher.tick(ctx)
+        assert ctx.state == watcher.State.IDLE
+        assert ctx.capture_process is None
+
+    def test_recording_grace_conference_back_restarts(self, ctx):
+        """RECORDING -> GRACE_PERIOD -> conference back -> RECORDING (new capture)."""
+        proc = _mock_popen()
+        ctx.capture_process = proc
+        ctx.state = watcher.State.RECORDING
+        ctx.current_transcript = ctx.config.transcripts_dir / "test.txt"
+        ctx.current_transcript.touch()
+
+        # Tick 1: conference gone -> grace period
+        with patch.object(watcher, "is_in_conference", return_value=False):
+            watcher.tick(ctx)
+        assert ctx.state == watcher.State.GRACE_PERIOD
+
+        # Tick 2: conference comes back during grace period -> restart capture
+        with patch.object(watcher, "is_in_conference", return_value=True), \
+             patch.object(watcher, "stop_capture") as mock_stop, \
+             patch.object(watcher, "start_capture") as mock_start:
+            watcher.tick(ctx)
+        mock_stop.assert_called_once_with(ctx)
+        mock_start.assert_called_once_with(ctx)
+
+    def test_recording_3_crashes_backoff_timeout_idle(self, ctx):
+        """RECORDING -> 3 crashes -> BACKOFF -> timeout -> IDLE."""
+        now = time.time()
+        # Fill crash_times to max_rapid_crashes (3) within crash_window
+        ctx.crash_times = [now - 5, now - 3, now - 1]
+
+        # start_capture checks crash_times and enters BACKOFF
+        with patch.object(watcher, "update_symlink"), \
+             patch.object(watcher, "notify"):
+            watcher.start_capture(ctx)
+
+        assert ctx.state == watcher.State.BACKOFF
+        assert ctx.backoff_until is not None
+
+        # Tick while still in backoff window -> returns early, stays BACKOFF
+        with patch.object(watcher, "is_in_conference", return_value=False):
+            watcher.tick(ctx)
+        assert ctx.state == watcher.State.BACKOFF
+
+        # Simulate backoff timer expired
+        ctx.backoff_until = time.time() - 1
+
+        # Next tick -> backoff ends, state returns to IDLE
+        with patch.object(watcher, "is_in_conference", return_value=False):
+            watcher.tick(ctx)
+        assert ctx.state == watcher.State.IDLE
+        assert ctx.backoff_until is None
+
+    def test_backoff_returns_early_until_expired(self, ctx):
+        """BACKOFF -> tick returns early until backoff_until expires."""
+        ctx.state = watcher.State.BACKOFF
+        ctx.backoff_until = time.time() + 100  # far in the future
+
+        with patch.object(watcher, "is_in_conference") as mock_conf:
+            watcher.tick(ctx)
+        # is_in_conference should NOT be called during backoff
+        mock_conf.assert_not_called()
+        assert ctx.state == watcher.State.BACKOFF
+
+
+class TestControlCommands:
+    """Tests for _read_control() — reading and consuming control JSON."""
+
+    def test_valid_pause(self, config):
+        ctrl = config.install_dir / "watcher-control.json"
+        ctrl.write_text(json.dumps({"action": "pause"}))
+        result = watcher._read_control(config)
+        assert result == "pause"
+
+    def test_valid_resume(self, config):
+        ctrl = config.install_dir / "watcher-control.json"
+        ctrl.write_text(json.dumps({"action": "resume"}))
+        result = watcher._read_control(config)
+        assert result == "resume"
+
+    def test_valid_end(self, config):
+        ctrl = config.install_dir / "watcher-control.json"
+        ctrl.write_text(json.dumps({"action": "end"}))
+        result = watcher._read_control(config)
+        assert result == "end"
+
+    def test_malformed_json(self, config):
+        ctrl = config.install_dir / "watcher-control.json"
+        ctrl.write_text("{not valid json!!!")
+        result = watcher._read_control(config)
+        assert result is None
+
+    def test_missing_file(self, config):
+        result = watcher._read_control(config)
+        assert result is None
+
+    def test_file_consumed_after_read(self, config):
+        ctrl = config.install_dir / "watcher-control.json"
+        ctrl.write_text(json.dumps({"action": "pause"}))
+        watcher._read_control(config)
+        assert not ctrl.exists()
+
+
+class TestUserConfig:
+    """Tests for _load_user_config()."""
+
+    def test_valid_config(self, tmp_path):
+        cfg = {
+            "whisper_model": "large-v3",
+            "diarization": "true",
+            "language": "en",
+        }
+        (tmp_path / "config.json").write_text(json.dumps(cfg))
+        result = watcher._load_user_config(tmp_path)
+        assert result["whisper_model"] == "large-v3"
+        assert result["diarization"] == "true"
+        assert result["language"] == "en"
+
+    def test_empty_file(self, tmp_path):
+        (tmp_path / "config.json").write_text("")
+        result = watcher._load_user_config(tmp_path)
+        assert result == {}
+
+    def test_missing_file(self, tmp_path):
+        result = watcher._load_user_config(tmp_path)
+        assert result == {}
+
+    def test_malformed_json(self, tmp_path):
+        (tmp_path / "config.json").write_text("{{broken json")
+        result = watcher._load_user_config(tmp_path)
+        assert result == {}
+
+
+class TestWriteStatus:
+    """Tests for write_status() — JSON structure and round-trip."""
+
+    def test_write_recording_status(self, config):
+        watcher.write_status(config, "RECORDING", "2026-01-01_10-00-00.txt")
+        path = config.status_file or (config.install_dir / "watcher-status.json")
+        data = json.loads(path.read_text())
+        assert data["state"] == "RECORDING"
+        assert data["transcript"] == "2026-01-01_10-00-00.txt"
+        assert "timestamp" in data
+        assert isinstance(data["timestamp"], float)
+
+    def test_write_idle_status(self, config):
+        watcher.write_status(config, "IDLE")
+        path = config.status_file or (config.install_dir / "watcher-status.json")
+        data = json.loads(path.read_text())
+        assert data["state"] == "IDLE"
+        assert "transcript" not in data
+
+    def test_read_back_json_structure(self, config):
+        before = time.time()
+        watcher.write_status(config, "RECORDING", "test.txt")
+        after = time.time()
+        path = config.status_file or (config.install_dir / "watcher-status.json")
+        data = json.loads(path.read_text())
+        assert set(data.keys()) == {"state", "transcript", "timestamp"}
+        assert before <= data["timestamp"] <= after
