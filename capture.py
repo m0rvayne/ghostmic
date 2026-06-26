@@ -36,6 +36,7 @@ CAPTURE_MODE = os.environ.get("CAPTURE_MODE", "coreaudio")  # "coreaudio" or "le
 BUNDLE_ID = os.environ.get("BUNDLE_ID", "us.zoom.xos")
 
 AUDIO_TAP_BIN = Path(__file__).parent / ".build" / "process-audio-tap"
+ENABLE_LLM_POST = os.environ.get("LLM_POST", "1") == "1"
 
 # Bounded queues
 audio_queue = queue.Queue(maxsize=MAX_QUEUE_CHUNKS)
@@ -198,6 +199,90 @@ def transcribe_chunk(model_unused, audio_np: np.ndarray) -> str:
     return text
 
 
+# -- Post-processing (rule-based + optional LLM) ------------------------------
+
+_prev_chunks: list[str] = []
+_prev_speaker: str = ""
+_llm_model = None
+_llm_tokenizer = None
+
+
+def _load_llm():
+    """Load micro LLM for transcript post-processing. Called once."""
+    global _llm_model, _llm_tokenizer
+    if _llm_model is not None:
+        return True
+    try:
+        from mlx_lm import load
+        _llm_model, _llm_tokenizer = load("mlx-community/Qwen3-0.6B-4bit")
+        print("[meeting] LLM post-processor ready (Qwen3-0.6B)", flush=True)
+        return True
+    except Exception as e:
+        print(f"[meeting] LLM not available: {e}. Using rule-based only.", file=sys.stderr, flush=True)
+        return False
+
+
+def _postprocess_text(text: str, timestamp: str) -> str:
+    """Post-process transcribed text: speaker continuity + optional LLM refinement."""
+    global _prev_speaker
+
+    # Phase 1: Rule-based speaker continuity
+    current_speaker = ""
+    clean_text = text
+    for label in ["[You + Remote]", "[You]", "[Remote]"]:
+        if text.startswith(label):
+            current_speaker = label
+            clean_text = text[len(label):].strip()
+            break
+
+    # If same speaker as last chunk and no pause, mark as continuation
+    show_label = True
+    if current_speaker == _prev_speaker and current_speaker:
+        show_label = False  # same speaker continues
+
+    if current_speaker:
+        _prev_speaker = current_speaker
+
+    # Phase 2: LLM refinement (if available)
+    if ENABLE_LLM_POST and _llm_model is not None and _prev_chunks:
+        try:
+            from mlx_lm import generate
+            context = "\n".join(_prev_chunks[-3:])
+            prompt = f"""Fix this speech-to-text transcript chunk using the context. Rules:
+- Fix obvious recognition errors based on context
+- If chunk starts mid-sentence (continuing previous), merge naturally
+- Keep it concise, output ONLY the corrected text
+- Keep the same language as input
+- Do NOT add anything not in the original
+
+Context:
+{context}
+
+New chunk:
+{clean_text}
+
+/no_think
+Corrected:"""
+            messages = [{"role": "user", "content": prompt}]
+            formatted = _llm_tokenizer.apply_chat_template(messages, add_generation_prompt=True, tokenize=False)
+            result = generate(_llm_model, _llm_tokenizer, prompt=formatted, max_tokens=150, temp=0.1)
+            result = result.strip()
+            if result and len(result) > 5 and not _is_hallucination(result):
+                clean_text = result
+        except Exception as e:
+            pass  # fall back to rule-based
+
+    # Store for context
+    _prev_chunks.append(f"{timestamp} {current_speaker} {clean_text}")
+    if len(_prev_chunks) > 5:
+        _prev_chunks.pop(0)
+
+    # Build final line
+    if show_label and current_speaker:
+        return f"{current_speaker} {clean_text}"
+    return clean_text
+
+
 def _drain_queue(q: queue.Queue) -> list:
     items = []
     while True:
@@ -278,7 +363,10 @@ def writer_thread(model, has_mic: bool):
                             text = _build_diarized_text(text, segments, len(audio_bh_padded))
                         except Exception:
                             pass
-                    line = f"[{format_time(chunk_start)}-{format_time(chunk_end)}] {text}\n"
+                    # Post-process: speaker continuity + LLM refinement
+                    ts = f"[{format_time(chunk_start)}-{format_time(chunk_end)}]"
+                    text = _postprocess_text(text, ts)
+                    line = f"{ts} {text}\n"
                     _write_transcript(TRANSCRIPT_FILE, line)
                     print(f"[meeting] -> {text[:80]}...", flush=True)
                 else:
@@ -462,6 +550,11 @@ def start_mic_stream():
 # -- Main --------------------------------------------------------------------
 
 def main():
+    # Load LLM for post-processing (if enabled)
+    if ENABLE_LLM_POST:
+        print("[meeting] Loading LLM post-processor...", flush=True)
+        _load_llm()
+
     TRANSCRIPT_FILE.parent.mkdir(parents=True, exist_ok=True)
 
     now = datetime.now()
