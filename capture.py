@@ -277,13 +277,12 @@ Corrected:"""
     if len(_prev_chunks) > 5:
         _prev_chunks.pop(0)
 
-    # Build final line — always include speaker label
+    # Build final line
     if current_speaker:
         if show_label:
             return f"{current_speaker} {clean_text}"
         else:
-            # Same speaker continues — show with "..." prefix to indicate continuation
-            return f"{current_speaker} ...{clean_text}"
+            return f"...{clean_text}"
     return clean_text
 
 
