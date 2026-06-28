@@ -369,7 +369,7 @@ def writer_thread(model, has_mic: bool):
                     # Post-process: speaker continuity + LLM refinement
                     ts = f"[{format_time(chunk_start)}-{format_time(chunk_end)}]"
                     text = _postprocess_text(text, ts)
-                    line = f"{ts} {text}\n"
+                    line = f"{ts}\n{text}\n\n"
                     _write_transcript(TRANSCRIPT_FILE, line)
                     print(f"[meeting] -> {text[:80]}...", flush=True)
                 else:
