@@ -330,7 +330,7 @@ def start_capture(ctx: WatcherContext):
     config = ctx.config
 
     # Crash rate limiting
-    now = time.time()
+    now = time.monotonic()
     ctx.crash_times = [t for t in ctx.crash_times if now - t < config.crash_window]
     if len(ctx.crash_times) >= config.max_rapid_crashes:
         logger.warning(f"capture.py crashed {config.max_rapid_crashes} times in {config.crash_window}s — backing off 60s")
@@ -399,7 +399,7 @@ def stop_capture(ctx: WatcherContext):
             ctx.capture_process.kill()
 
     if ctx.capture_process and ctx.capture_process.returncode and ctx.capture_process.returncode != 0:
-        ctx.crash_times.append(time.time())
+        ctx.crash_times.append(time.monotonic())
 
     saved_name = ctx.current_transcript.name if ctx.current_transcript else "unknown"
     ctx.capture_process = None
@@ -445,7 +445,7 @@ def tick(ctx: WatcherContext):
 
     # Handle backoff: return early until timer expires
     if ctx.state == State.BACKOFF:
-        if time.time() < ctx.backoff_until:
+        if time.monotonic() < ctx.backoff_until:
             return
         logger.info("Backoff period ended — resuming normal operation")
         ctx.state = State.IDLE
@@ -502,10 +502,10 @@ def tick(ctx: WatcherContext):
     else:
         if is_recording or ctx.state == State.PAUSED:
             if ctx.grace_start is None:
-                ctx.grace_start = time.time()
+                ctx.grace_start = time.monotonic()
                 ctx.state = State.GRACE_PERIOD
                 logger.info(f"Meeting ended — waiting {ctx.config.grace_period}s grace period...")
-            elif time.time() - ctx.grace_start >= ctx.config.grace_period:
+            elif time.monotonic() - ctx.grace_start >= ctx.config.grace_period:
                 logger.info("Grace period elapsed — stopping capture")
                 if ctx.state == State.PAUSED and ctx.capture_process:
                     ctx.capture_process.send_signal(signal.SIGCONT)

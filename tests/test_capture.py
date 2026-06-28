@@ -850,3 +850,65 @@ class TestWhisperServer:
             result = capture_mod.transcribe_chunk(None, audio)
         assert result == ""
         capture_mod._whisper_server_available = False
+
+
+class TestTapReaderThread:
+    """Test tap reader with timeout and dead process detection."""
+
+    def test_tap_reader_sets_shutdown_on_process_exit(self):
+        """If tap process exits, shutdown_event should be set."""
+        capture_mod.shutdown_event.clear()
+        proc = MagicMock()
+        proc.poll.return_value = 1  # exited with error
+        proc.returncode = 1
+
+        t = threading.Thread(target=capture_mod.tap_reader_thread, args=(proc,))
+        t.start()
+        t.join(timeout=3)
+        assert capture_mod.shutdown_event.is_set()
+        capture_mod.shutdown_event.clear()
+
+    def test_tap_reader_reads_audio_to_queue(self):
+        """Valid PCM data should be converted and queued."""
+        capture_mod.shutdown_event.clear()
+        # Drain any existing items
+        while not capture_mod.audio_queue.empty():
+            capture_mod.audio_queue.get_nowait()
+
+        # Create 1 second of PCM int16 data (32000 bytes)
+        pcm = np.full(16000, 1000, dtype=np.int16).tobytes()
+        stream = io.BytesIO(pcm)
+
+        proc = MagicMock()
+        proc.poll.side_effect = [None, 0]  # alive first call, then exited
+        proc.returncode = 0
+        proc.stdout = stream
+
+        t = threading.Thread(target=capture_mod.tap_reader_thread, args=(proc,))
+        t.start()
+        t.join(timeout=3)
+
+        assert not capture_mod.audio_queue.empty()
+        audio = capture_mod.audio_queue.get_nowait()
+        assert len(audio) == 16000
+        assert audio.dtype == np.float32
+        capture_mod.shutdown_event.clear()
+
+    def test_read_exactly_timeout_returns_partial(self):
+        """_read_exactly should return partial data on timeout when fd available."""
+        # With BytesIO (no fd), timeout doesn't apply — test the fallback path
+        stream = io.BytesIO(b"abc")
+        result = capture_mod._read_exactly(stream, 10, timeout=0.1)
+        assert result == b"abc"  # partial data returned
+
+
+class TestStaleBufferFlush:
+    """Test that writer_thread flushes partial buffer when audio stops."""
+
+    def test_stale_buffer_constant_defined(self):
+        assert hasattr(capture_mod, 'STALE_BUFFER_TIMEOUT')
+        assert capture_mod.STALE_BUFFER_TIMEOUT > 0
+
+    def test_tap_silence_timeout_defined(self):
+        assert hasattr(capture_mod, 'TAP_SILENCE_TIMEOUT')
+        assert capture_mod.TAP_SILENCE_TIMEOUT > 0

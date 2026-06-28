@@ -207,7 +207,7 @@ class TestTickSequences:
         assert ctx.grace_start is not None
 
         # Simulate grace period elapsed
-        ctx.grace_start = time.time() - ctx.config.grace_period - 1
+        ctx.grace_start = time.monotonic() - ctx.config.grace_period - 1
 
         # Tick 2: still no conference, grace expired -> stop capture
         with patch.object(watcher, "is_in_conference", return_value=False):
@@ -238,7 +238,7 @@ class TestTickSequences:
 
     def test_recording_3_crashes_backoff_timeout_idle(self, ctx):
         """RECORDING -> 3 crashes -> BACKOFF -> timeout -> IDLE."""
-        now = time.time()
+        now = time.monotonic()
         # Fill crash_times to max_rapid_crashes (3) within crash_window
         ctx.crash_times = [now - 5, now - 3, now - 1]
 
@@ -256,7 +256,7 @@ class TestTickSequences:
         assert ctx.state == watcher.State.BACKOFF
 
         # Simulate backoff timer expired
-        ctx.backoff_until = time.time() - 1
+        ctx.backoff_until = time.monotonic() - 1
 
         # Next tick -> backoff ends, state returns to IDLE
         with patch.object(watcher, "is_in_conference", return_value=False):
@@ -267,7 +267,7 @@ class TestTickSequences:
     def test_backoff_returns_early_until_expired(self, ctx):
         """BACKOFF -> tick returns early until backoff_until expires."""
         ctx.state = watcher.State.BACKOFF
-        ctx.backoff_until = time.time() + 100  # far in the future
+        ctx.backoff_until = time.monotonic() + 100  # far in the future
 
         with patch.object(watcher, "is_in_conference") as mock_conf:
             watcher.tick(ctx)

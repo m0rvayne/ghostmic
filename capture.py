@@ -456,11 +456,15 @@ def _touch_heartbeat(path: Path):
         pass
 
 
+STALE_BUFFER_TIMEOUT = 5  # flush partial buffer if no new audio for this many seconds
+
+
 def writer_thread(model, has_mic: bool):
     buffer_bh = []
     buffer_mic = []
     chunk_start = datetime.now()
-    last_heartbeat = time.time()
+    last_heartbeat = time.monotonic()
+    last_audio_received = time.monotonic()
 
     print(f"[meeting] Recording... transcript -> {TRANSCRIPT_FILE}", flush=True)
 
@@ -472,6 +476,8 @@ def writer_thread(model, has_mic: bool):
                     bh_chunks = [audio_queue.get(timeout=0.5)]
                 except queue.Empty:
                     pass
+            if bh_chunks:
+                last_audio_received = time.monotonic()
             buffer_bh.extend(bh_chunks)
 
             if has_mic:
@@ -479,7 +485,14 @@ def writer_thread(model, has_mic: bool):
 
             total_bh = sum(d.size for d in buffer_bh)
 
-            if total_bh >= SAMPLE_RATE * CHUNK_SECONDS:
+            # Flush partial buffer if audio stopped flowing
+            stale = (buffer_bh
+                     and total_bh < SAMPLE_RATE * CHUNK_SECONDS
+                     and time.monotonic() - last_audio_received > STALE_BUFFER_TIMEOUT)
+
+            if total_bh >= SAMPLE_RATE * CHUNK_SECONDS or stale:
+                if stale:
+                    print("[meeting] No new audio — flushing partial buffer", flush=True)
                 audio_bh = np.concatenate([b.flatten() for b in buffer_bh]).astype(np.float32)
                 buffer_bh = []
 
@@ -518,12 +531,12 @@ def writer_thread(model, has_mic: bool):
                     print("[meeting] (silence)", flush=True)
                     _touch_heartbeat(TRANSCRIPT_FILE)
 
-                last_heartbeat = time.time()
+                last_heartbeat = time.monotonic()
                 chunk_start = chunk_end
             else:
-                if time.time() - last_heartbeat > 60:
+                if time.monotonic() - last_heartbeat > 60:
                     _touch_heartbeat(TRANSCRIPT_FILE)
-                    last_heartbeat = time.time()
+                    last_heartbeat = time.monotonic()
 
         # Flush remaining
         if buffer_bh:
@@ -556,16 +569,29 @@ def writer_thread(model, has_mic: bool):
 
 # -- CoreAudio Tap reader (reads PCM from process-audio-tap stdout) -----------
 
-def _read_exactly(stream, n: int) -> bytes:
-    """Read exactly n bytes from a raw stream, handling short reads."""
+def _read_exactly(stream, n: int, timeout: float = 5.0) -> bytes:
+    """Read exactly n bytes from a raw stream, with timeout.
+    Returns partial data or empty bytes on timeout/EOF."""
+    import select
     buf = bytearray()
     raw = stream.raw if hasattr(stream, 'raw') else stream
+    try:
+        fd = raw.fileno()
+    except Exception:
+        fd = None  # no select() support (e.g. BytesIO in tests)
     while len(buf) < n:
+        if fd is not None:
+            ready, _, _ = select.select([fd], [], [], timeout)
+            if not ready:
+                return bytes(buf) if buf else b''  # timeout
         chunk = raw.read(n - len(buf))
         if not chunk:
-            return bytes(buf) if buf else b''
+            return bytes(buf) if buf else b''  # EOF
         buf.extend(chunk)
     return bytes(buf)
+
+
+TAP_SILENCE_TIMEOUT = 10  # seconds with no data → treat tap as dead
 
 
 def tap_reader_thread(proc: subprocess.Popen):
@@ -573,14 +599,33 @@ def tap_reader_thread(proc: subprocess.Popen):
     BYTES_PER_SAMPLE = 2
     CHUNK_SAMPLES = SAMPLE_RATE  # 1 second chunks
     CHUNK_BYTES = CHUNK_SAMPLES * BYTES_PER_SAMPLE
+    silence_start = None
 
     try:
         while not shutdown_event.is_set():
-            data = _read_exactly(proc.stdout, CHUNK_BYTES)
-            if not data:
-                print("[meeting] Tap process ended", flush=True)
+            # Check if tap process died
+            if proc.poll() is not None:
+                print(f"[meeting] Tap process exited (code {proc.returncode})", flush=True)
                 shutdown_event.set()
                 break
+
+            data = _read_exactly(proc.stdout, CHUNK_BYTES, timeout=2.0)
+            if not data:
+                # No data — could be timeout or EOF
+                if proc.poll() is not None:
+                    print("[meeting] Tap process ended", flush=True)
+                    shutdown_event.set()
+                    break
+                # Track consecutive silence (tap alive but no audio)
+                if silence_start is None:
+                    silence_start = time.monotonic()
+                elif time.monotonic() - silence_start > TAP_SILENCE_TIMEOUT:
+                    print("[meeting] Tap produced no audio for 10s — assuming dead", flush=True)
+                    shutdown_event.set()
+                    break
+                continue
+
+            silence_start = None  # got data, reset silence tracker
             audio = np.frombuffer(data, dtype=np.int16).astype(np.float32) / 32768.0
             try:
                 audio_queue.put_nowait(audio)
