@@ -153,7 +153,7 @@ if [[ -f "$WHISPER_MODEL" ]]; then
 else
     say "Downloading whisper model 'large-v3-turbo' (~1.5GB, one-time)..."
     mkdir -p "$INSTALL_DIR/models"
-    if curl -L --progress-bar -o "$WHISPER_MODEL" \
+    if curl -L -C - --progress-bar -o "$WHISPER_MODEL" \
         https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3-turbo.bin; then
         ok "Whisper model ready"
     else

@@ -566,8 +566,8 @@ class TestCheckZoomMute:
     """Test Zoom mute detection via mocked osascript."""
 
     def test_russian_zoom_muted(self):
-        """Russian Zoom UI: 'Конференция' menu with 'Включить звук' => muted."""
-        mock_result = MagicMock(stdout="muted\n", returncode=0)
+        """Russian Zoom UI: menu items contain 'Включить звук' => muted."""
+        mock_result = MagicMock(stdout="Запись|Включить звук|Настройки\n", returncode=0)
         with patch("capture.subprocess.run", return_value=mock_result) as mock_run:
             result = capture_mod._check_zoom_mute()
         assert result is True
@@ -576,22 +576,22 @@ class TestCheckZoomMute:
         assert call_args[1]["timeout"] == 3
 
     def test_english_zoom_muted(self):
-        """English Zoom UI: 'Meeting' menu with 'Unmute Audio' => muted."""
-        mock_result = MagicMock(stdout="muted\n", returncode=0)
+        """English Zoom UI: menu items contain 'Unmute Audio' => muted."""
+        mock_result = MagicMock(stdout="Record|Unmute Audio|Settings\n", returncode=0)
         with patch("capture.subprocess.run", return_value=mock_result):
             result = capture_mod._check_zoom_mute()
         assert result is True
 
     def test_zoom_unmuted(self):
-        """When Zoom is unmuted, osascript returns 'unmuted'."""
-        mock_result = MagicMock(stdout="unmuted\n", returncode=0)
+        """When Zoom is unmuted, no unmute keywords in menu."""
+        mock_result = MagicMock(stdout="Record|Mute Audio|Settings\n", returncode=0)
         with patch("capture.subprocess.run", return_value=mock_result):
             result = capture_mod._check_zoom_mute()
         assert result is False
 
     def test_not_in_meeting(self):
-        """No Meeting/Конференция menu found => 'no-meeting' => not muted."""
-        mock_result = MagicMock(stdout="no-meeting\n", returncode=0)
+        """Empty menu output => not muted."""
+        mock_result = MagicMock(stdout="\n", returncode=0)
         with patch("capture.subprocess.run", return_value=mock_result):
             result = capture_mod._check_zoom_mute()
         assert result is False
@@ -750,6 +750,73 @@ class TestParticipantDetection:
         mock_result = MagicMock(returncode=0, stdout=b'not json')
         self._run_one_poll(mock_result)
         assert capture_mod.get_participants() == ["Alice"]
+
+
+class TestDiarizationCalibration:
+    """Test auto-calibration of diarization thresholds."""
+
+    def setup_method(self):
+        # Reset calibration state
+        capture_mod._calibrated_silence = 0.005
+        capture_mod._calibrated_ratio = 2.5
+        capture_mod._calibration_done = False
+
+    def test_calibrate_sets_done_flag(self):
+        bh = np.random.randn(SAMPLE_RATE * 5).astype(np.float32) * 0.01
+        mic = np.random.randn(SAMPLE_RATE * 5).astype(np.float32) * 0.005
+        capture_mod._calibrate_thresholds(bh, mic)
+        assert capture_mod._calibration_done is True
+
+    def test_calibrate_adjusts_silence_threshold(self):
+        # Loud noise floor → higher silence threshold
+        bh = np.random.randn(SAMPLE_RATE * 5).astype(np.float32) * 0.03
+        mic = np.random.randn(SAMPLE_RATE * 5).astype(np.float32) * 0.03
+        capture_mod._calibrate_thresholds(bh, mic)
+        assert capture_mod._calibrated_silence > 0.005  # raised from default
+
+    def test_calibrate_quiet_room(self):
+        # Very quiet → threshold stays low
+        bh = np.random.randn(SAMPLE_RATE * 5).astype(np.float32) * 0.001
+        mic = np.random.randn(SAMPLE_RATE * 5).astype(np.float32) * 0.001
+        capture_mod._calibrate_thresholds(bh, mic)
+        assert capture_mod._calibrated_silence < 0.01
+
+    def test_calibrate_ratio_clamped(self):
+        # Extreme mic/bh ratio should be clamped
+        bh = np.random.randn(SAMPLE_RATE * 5).astype(np.float32) * 0.001
+        mic = np.random.randn(SAMPLE_RATE * 5).astype(np.float32) * 0.1
+        capture_mod._calibrate_thresholds(bh, mic)
+        assert 1.5 <= capture_mod._calibrated_ratio <= 5.0
+
+    def test_calibrate_empty_audio(self):
+        bh = np.array([], dtype=np.float32)
+        mic = np.array([], dtype=np.float32)
+        capture_mod._calibrate_thresholds(bh, mic)
+        assert capture_mod._calibration_done is True
+
+    def teardown_method(self):
+        capture_mod._calibrated_silence = 0.005
+        capture_mod._calibrated_ratio = 2.5
+        capture_mod._calibration_done = False
+
+
+class TestHallucinationRepetition:
+    """Test repetition-based hallucination detection."""
+
+    def test_repeated_word_is_hallucination(self):
+        assert capture_mod._is_hallucination("да да да") is True
+
+    def test_repeated_word_four_times(self):
+        assert capture_mod._is_hallucination("okay okay okay okay") is True
+
+    def test_different_words_not_hallucination(self):
+        assert capture_mod._is_hallucination("hello world today") is False
+
+    def test_two_same_words_not_hallucination(self):
+        assert capture_mod._is_hallucination("да да") is False
+
+
+SAMPLE_RATE = capture_mod.SAMPLE_RATE
 
 
 class TestWhisperServer:

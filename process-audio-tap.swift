@@ -163,9 +163,10 @@ class PCMConverter {
     private let inputFormat: AudioStreamBasicDescription
     private let outputFormat: AudioStreamBasicDescription
 
-    // Ring buffer for input data
+    // Ring buffer for input data (capped to prevent unbounded growth)
     private var inputBuffer = Data()
     private let lock = NSLock()
+    private static let maxBufferSize = 1_048_576  // 1MB — ~3s at 48kHz stereo float32
 
     init(inputFormat: AudioStreamBasicDescription) throws {
         self.inputFormat = inputFormat
@@ -211,6 +212,11 @@ class PCMConverter {
 
         lock.lock()
         inputBuffer.append(Data(bytes: inputData, count: inputByteCount))
+        // Drop oldest data if buffer exceeds cap
+        if inputBuffer.count > PCMConverter.maxBufferSize {
+            let excess = inputBuffer.count - PCMConverter.maxBufferSize
+            inputBuffer.removeFirst(excess)
+        }
         lock.unlock()
 
         // Calculate how many output frames we can produce

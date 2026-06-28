@@ -101,6 +101,7 @@ class WatcherContext:
     backoff_until: Optional[float] = None
     running: bool = True
     whisper_server_process: Optional[subprocess.Popen] = None
+    _whisper_log_file: Optional[object] = None
 
 
 # --------------------------------------------------------------------------
@@ -214,16 +215,32 @@ def is_in_conference() -> bool:
 # Status file (for menu bar indicator)
 # --------------------------------------------------------------------------
 
-def write_status(config: WatcherConfig, state: str, transcript: str = None):
+def write_status(config: WatcherConfig, state: str, transcript: str = None,
+                  backoff_until: float = None):
     """Write status JSON for the menu bar indicator to read."""
     data = {"state": state, "timestamp": time.time()}
     if transcript:
         data["transcript"] = transcript
+    if backoff_until is not None:
+        data["backoff_until"] = backoff_until
     try:
         path = config.status_file or (config.install_dir / "watcher-status.json")
         path.write_text(json.dumps(data), encoding="utf-8")
     except Exception:
         pass
+
+
+def _read_persisted_backoff(config: WatcherConfig) -> float | None:
+    """Read backoff_until from status file (wall clock). Returns None if expired or absent."""
+    try:
+        path = config.status_file or (config.install_dir / "watcher-status.json")
+        data = json.loads(path.read_text())
+        backoff = data.get("backoff_until")
+        if backoff and backoff > time.time():
+            return backoff
+    except Exception:
+        pass
+    return None
 
 
 # --------------------------------------------------------------------------
@@ -290,10 +307,10 @@ def start_whisper_server(ctx: WatcherContext):
         cmd.extend(["-l", language])
 
     log_path = ctx.config.install_dir / "whisper-server.log"
-    log_file = open(log_path, "a")
+    ctx._whisper_log_file = open(log_path, "a")
 
     ctx.whisper_server_process = subprocess.Popen(
-        cmd, stdout=log_file, stderr=log_file,
+        cmd, stdout=ctx._whisper_log_file, stderr=ctx._whisper_log_file,
     )
     logger.info(f"whisper-server started (PID {ctx.whisper_server_process.pid}, port {WHISPER_SERVER_PORT})")
 
@@ -320,6 +337,12 @@ def stop_whisper_server(ctx: WatcherContext):
             ctx.whisper_server_process.kill()
         logger.info("whisper-server stopped")
     ctx.whisper_server_process = None
+    if ctx._whisper_log_file:
+        try:
+            ctx._whisper_log_file.close()
+        except Exception:
+            pass
+        ctx._whisper_log_file = None
 
 
 # --------------------------------------------------------------------------
@@ -337,6 +360,7 @@ def start_capture(ctx: WatcherContext):
         ctx.crash_times.clear()
         ctx.state = State.BACKOFF
         ctx.backoff_until = now + 60.0
+        write_status(config, "BACKOFF", backoff_until=time.time() + 60.0)
         return
 
     timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
@@ -522,6 +546,14 @@ def main():
     kill_orphan_capture(config)
 
     ctx = WatcherContext(config=config)
+
+    # Restore backoff state from previous run (prevents crash loop on restart)
+    persisted_backoff = _read_persisted_backoff(config)
+    if persisted_backoff:
+        remaining = persisted_backoff - time.time()
+        ctx.state = State.BACKOFF
+        ctx.backoff_until = time.monotonic() + remaining
+        logger.info(f"Resuming backoff from previous run ({remaining:.0f}s remaining)")
 
     def handle_signal(sig, frame):
         ctx.running = False

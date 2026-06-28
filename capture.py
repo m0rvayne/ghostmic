@@ -92,13 +92,56 @@ def get_remote_participants() -> list[str]:
 
 _detected_language = None
 
+# -- Diarization calibration --------------------------------------------------
+
+_calibrated_silence = 0.005  # default, updated by calibration
+_calibrated_ratio = 2.5      # default, updated by calibration
+_calibration_done = False
+_calibration_bh_samples: list[np.ndarray] = []
+_calibration_mic_samples: list[np.ndarray] = []
+CALIBRATION_SECONDS = 5
+
+
+def _calibrate_thresholds(audio_bh: np.ndarray, audio_mic: np.ndarray):
+    """Calibrate silence threshold and speaker ratio from noise floor measurement."""
+    global _calibrated_silence, _calibrated_ratio, _calibration_done
+
+    # Measure RMS noise floor (95th percentile of frame energies)
+    frame_size = int(SAMPLE_RATE * 0.5)  # 500ms frames
+    bh_energies = []
+    mic_energies = []
+    for i in range(0, min(len(audio_bh), len(audio_mic)), frame_size):
+        bh_energies.append(np.sqrt(np.mean(audio_bh[i:i + frame_size] ** 2)))
+        mic_energies.append(np.sqrt(np.mean(audio_mic[i:i + frame_size] ** 2)))
+
+    if not bh_energies:
+        _calibration_done = True
+        return
+
+    bh_floor = float(np.percentile(bh_energies, 95))
+    mic_floor = float(np.percentile(mic_energies, 95))
+    noise_floor = max(bh_floor, mic_floor)
+
+    # Silence threshold: 1.5x noise floor, clamped to reasonable range
+    _calibrated_silence = max(0.002, min(0.05, noise_floor * 1.5))
+
+    # Ratio threshold: based on bleed ratio, clamped 1.5–5.0
+    if bh_floor > 1e-6:
+        bleed_ratio = mic_floor / bh_floor
+        _calibrated_ratio = max(1.5, min(5.0, bleed_ratio * 2.0))
+
+    _calibration_done = True
+    print(f"[meeting] Diarization calibrated: silence={_calibrated_silence:.4f}, ratio={_calibrated_ratio:.1f} "
+          f"(noise floor: bh={bh_floor:.4f}, mic={mic_floor:.4f})", flush=True)
+
 
 def _classify_speakers(audio_bh: np.ndarray, audio_mic: np.ndarray,
                        frame_ms: int = 500) -> list[tuple[str, int, int]]:
     """Classify [You] vs [Remote] using energy ratio between the two channels."""
     frame_size = int(SAMPLE_RATE * frame_ms / 1000)
     segments = []
-    silence_threshold = 0.005
+    silence_threshold = _calibrated_silence
+    ratio_threshold = _calibrated_ratio
 
     for i in range(0, min(len(audio_bh), len(audio_mic)), frame_size):
         bh_frame = audio_bh[i:i + frame_size]
@@ -111,7 +154,7 @@ def _classify_speakers(audio_bh: np.ndarray, audio_mic: np.ndarray,
             continue
 
         ratio = energy_mic / (energy_bh + 1e-8)
-        speaker = "[You]" if ratio > 2.5 else "[Remote]"
+        speaker = "[You]" if ratio > ratio_threshold else "[Remote]"
         segments.append((speaker, i, i + frame_size))
 
     if not segments:
@@ -174,11 +217,22 @@ def format_time(dt: datetime) -> str:
 
 # Known Whisper hallucination patterns (appears on silence/quiet audio)
 _HALLUCINATION_PATTERNS = [
+    # RU
     "продолжение следует", "субтитры сделал", "спасибо за просмотр",
     "подписывайтесь на канал", "ставьте лайк", "до новых встреч",
-    "редактор субтитров", "корректор", "thanks for watching",
-    "subscribe", "like and subscribe", "see you next time",
-    "please subscribe", "thank you for watching",
+    "редактор субтитров", "корректор",
+    # EN
+    "thanks for watching", "subscribe", "like and subscribe",
+    "see you next time", "please subscribe", "thank you for watching",
+    # DE
+    "danke fürs zuschauen", "abonnieren", "bis zum nächsten mal",
+    "untertitel von", "untertitel der",
+    # FR
+    "merci d'avoir regardé", "abonnez-vous", "sous-titres",
+    # ES
+    "gracias por ver", "suscríbete",
+    # ZH / JA
+    "谢谢观看", "请订阅", "ご視聴ありがとう",
 ]
 
 MIN_SPEECH_RMS = 0.01  # below this = silence, skip transcription
@@ -196,6 +250,10 @@ def _is_hallucination(text: str) -> bool:
     for pattern in _HALLUCINATION_PATTERNS:
         if pattern in lower:
             return True
+    # Repetition heuristic: same word/phrase repeated 3+ times
+    words = lower.split()
+    if len(words) >= 3 and len(set(words)) == 1:
+        return True
     return False
 
 
@@ -460,11 +518,15 @@ STALE_BUFFER_TIMEOUT = 5  # flush partial buffer if no new audio for this many s
 
 
 def writer_thread(model, has_mic: bool):
+    global _calibration_done
     buffer_bh = []
     buffer_mic = []
     chunk_start = datetime.now()
     last_heartbeat = time.monotonic()
     last_audio_received = time.monotonic()
+    calibration_samples_bh = []
+    calibration_samples_mic = []
+    calibration_total = 0
 
     print(f"[meeting] Recording... transcript -> {TRANSCRIPT_FILE}", flush=True)
 
@@ -483,6 +545,22 @@ def writer_thread(model, has_mic: bool):
             if has_mic:
                 buffer_mic.extend(_drain_queue(mic_queue))
 
+            # Diarization calibration: collect first N seconds of audio
+            if has_mic and not _calibration_done and bh_chunks:
+                for chunk in bh_chunks:
+                    calibration_samples_bh.append(chunk.flatten())
+                    calibration_total += chunk.size
+                mic_chunks = _drain_queue(mic_queue)
+                for chunk in mic_chunks:
+                    calibration_samples_mic.append(chunk.flatten())
+                buffer_mic.extend(mic_chunks)
+                if calibration_total >= SAMPLE_RATE * CALIBRATION_SECONDS:
+                    cal_bh = np.concatenate(calibration_samples_bh)
+                    cal_mic = np.concatenate(calibration_samples_mic) if calibration_samples_mic else np.zeros_like(cal_bh)
+                    _calibrate_thresholds(cal_bh, cal_mic)
+                    calibration_samples_bh.clear()
+                    calibration_samples_mic.clear()
+
             total_bh = sum(d.size for d in buffer_bh)
 
             # Flush partial buffer if audio stopped flowing
@@ -500,9 +578,10 @@ def writer_thread(model, has_mic: bool):
                 if has_mic and buffer_mic:
                     audio_mic_raw = np.concatenate([b.flatten() for b in buffer_mic]).astype(np.float32)
                     buffer_mic = []
-                    max_len = max(len(audio_bh), len(audio_mic_raw))
-                    audio_bh_padded = np.pad(audio_bh, (0, max(0, max_len - len(audio_bh))))
-                    audio_mic_padded = np.pad(audio_mic_raw, (0, max(0, max_len - len(audio_mic_raw))))
+                    # Trim to shorter channel — padding with zeros causes false speaker labels
+                    min_len = min(len(audio_bh), len(audio_mic_raw))
+                    audio_bh_padded = audio_bh[:min_len]
+                    audio_mic_padded = audio_mic_raw[:min_len]
                     audio_mixed = np.clip((audio_bh_padded + audio_mic_padded) * 0.5, -1.0, 1.0)
                 else:
                     audio_mixed = audio_bh
@@ -545,9 +624,9 @@ def writer_thread(model, has_mic: bool):
             flush_bh_padded = audio
             if has_mic and buffer_mic:
                 mic_audio = np.concatenate(buffer_mic).flatten().astype(np.float32)
-                max_len = max(len(audio), len(mic_audio))
-                flush_bh_padded = np.pad(audio, (0, max(0, max_len - len(audio))))
-                flush_mic_padded = np.pad(mic_audio, (0, max(0, max_len - len(mic_audio))))
+                min_len = min(len(audio), len(mic_audio))
+                flush_bh_padded = audio[:min_len]
+                flush_mic_padded = mic_audio[:min_len]
                 audio = np.clip((flush_bh_padded + flush_mic_padded) * 0.5, -1.0, 1.0)
             text = transcribe_chunk(model, audio)
             if text:
@@ -641,37 +720,44 @@ def tap_reader_thread(proc: subprocess.Popen):
 _zoom_muted = False
 
 
+_UNMUTE_KEYWORDS = [
+    "unmute audio", "включить звук",       # EN, RU
+    "mikrofon einschalten", "stummschaltung aufheben",  # DE
+    "réactiver le son", "activer le son",   # FR
+    "reactivar audio", "activar sonido",    # ES
+    "riattiva audio",                       # IT
+    "ミュート解除",                           # JA
+    "음소거 해제",                            # KO
+    "取消静音",                               # ZH
+    "ativar som",                           # PT
+]
+
+
 def _check_zoom_mute() -> bool:
     """Check if Zoom mic is muted via AppleScript menu inspection.
-    Supports English and Russian Zoom UI."""
+    Scans all menu items for 'unmute' keywords across locales."""
     try:
         r = subprocess.run(
             ["osascript", "-e", '''tell application "System Events"
     tell process "zoom.us"
-        set menuNames to name of every menu bar item of menu bar 1
-        -- Find the meeting menu (English: "Meeting", Russian: "Конференция")
-        set meetingMenu to missing value
-        repeat with m in menuNames
-            if m is "Meeting" or m is "Конференция" then
-                set meetingMenu to m
-                exit repeat
-            end if
+        set allItems to ""
+        repeat with mb in menu bar items of menu bar 1
+            try
+                set menuItems to name of every menu item of menu 1 of mb
+                repeat with mi in menuItems
+                    set allItems to allItems & mi & "|"
+                end repeat
+            end try
         end repeat
-        if meetingMenu is missing value then return "no-meeting"
-
-        set items to name of every menu item of menu 1 of menu bar item meetingMenu of menu bar 1
-        -- Check for unmute item (EN: "Unmute Audio", RU: "Включить звук")
-        repeat with item in items
-            if item is "Unmute Audio" or item is "Включить звук" then
-                return "muted"
-            end if
-        end repeat
-        return "unmuted"
+        return allItems
     end tell
 end tell'''],
             capture_output=True, text=True, timeout=3
         )
-        return r.stdout.strip() == "muted"
+        items_lower = r.stdout.strip().lower()
+        if not items_lower:
+            return False
+        return any(kw in items_lower for kw in _UNMUTE_KEYWORDS)
     except Exception:
         return False
 
