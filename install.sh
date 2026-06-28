@@ -112,7 +112,7 @@ launchctl bootout "gui/$(id -u)/$LAUNCH_LABEL" 2>/dev/null || true
 # ── 5. Copy files ────────────────────────────────────────────────────────────
 say "Installing to $INSTALL_DIR..."
 mkdir -p "$INSTALL_DIR/transcripts"
-for f in server.py capture.py watcher.py requirements.txt update.sh process-audio-tap.swift statusbar.swift; do
+for f in server.py capture.py watcher.py requirements.txt update.sh process-audio-tap.swift statusbar.swift zoom-participants.swift; do
     [[ -f "$SCRIPT_DIR/$f" ]] && cp "$SCRIPT_DIR/$f" "$INSTALL_DIR/"
 done
 # Compile CoreAudio tap binary
@@ -122,6 +122,12 @@ if swiftc -O -framework CoreAudio -framework AudioToolbox -framework AppKit "$IN
 else
     err "Failed to compile audio capture tool"
     exit 1
+fi
+# Compile participant detection binary
+if swiftc -O -framework AppKit "$INSTALL_DIR/zoom-participants.swift" -o "$INSTALL_DIR/.build/zoom-participants" 2>&1; then
+    ok "Participant detection compiled (Accessibility API)"
+else
+    say "Warning: participant detection not compiled (speaker names unavailable)"
 fi
 
 # ── 6. Python venv + deps ───────────────────────────────────────────────────

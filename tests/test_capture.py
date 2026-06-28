@@ -621,3 +621,132 @@ class TestCheckZoomMute:
         with patch("capture.subprocess.run", return_value=mock_result):
             result = capture_mod._check_zoom_mute()
         assert result is False
+
+
+class TestParticipantDetection:
+    """Test participant name detection and integration."""
+
+    def setup_method(self):
+        """Reset participant state before each test."""
+        with capture_mod._participants_lock:
+            capture_mod._participants.clear()
+
+    def test_get_participants_empty(self):
+        assert capture_mod.get_participants() == []
+
+    def test_get_participants_returns_copy(self):
+        with capture_mod._participants_lock:
+            capture_mod._participants.extend(["Alice", "Bob"])
+        result = capture_mod.get_participants()
+        assert result == ["Alice", "Bob"]
+        # Verify it's a copy
+        result.append("Charlie")
+        assert capture_mod.get_participants() == ["Alice", "Bob"]
+
+    def test_get_remote_participants(self):
+        with capture_mod._participants_lock:
+            capture_mod._participants.extend(["Alice", "Bob"])
+        result = capture_mod.get_remote_participants()
+        assert "Alice" in result
+        assert "Bob" in result
+
+    def test_remote_label_single_participant(self):
+        with capture_mod._participants_lock:
+            capture_mod._participants.extend(["Sergey"])
+        label = capture_mod._remote_label()
+        assert label == "[Sergey]"
+
+    def test_remote_label_multiple_participants(self):
+        with capture_mod._participants_lock:
+            capture_mod._participants.extend(["Alice", "Bob"])
+        label = capture_mod._remote_label()
+        assert label == "[Remote]"
+
+    def test_remote_label_no_participants(self):
+        label = capture_mod._remote_label()
+        assert label == "[Remote]"
+
+    def test_build_diarized_text_with_named_remote(self):
+        with capture_mod._participants_lock:
+            capture_mod._participants.extend(["Sergey"])
+        segments = [("[Remote]", 0, 16000)]
+        result = capture_mod._build_diarized_text("Hello", segments, 16000)
+        assert result == "[Sergey] Hello"
+
+    def test_build_diarized_text_mixed_with_named_remote(self):
+        with capture_mod._participants_lock:
+            capture_mod._participants.extend(["Sergey"])
+        segments = [("[You]", 0, 8000), ("[Remote]", 8000, 16000)]
+        result = capture_mod._build_diarized_text("Hello", segments, 16000)
+        assert "Sergey" in result
+        assert "You" in result
+
+    def test_build_diarized_text_you_dominant_keeps_you(self):
+        with capture_mod._participants_lock:
+            capture_mod._participants.extend(["Sergey"])
+        # 80% You
+        segments = [("[You]", 0, 12800), ("[Remote]", 12800, 16000)]
+        result = capture_mod._build_diarized_text("Hello", segments, 16000)
+        assert result == "[You] Hello"
+
+    def test_postprocess_handles_named_speaker_label(self):
+        """Speaker labels like [Sergey] should be handled like [Remote]."""
+        capture_mod._prev_speaker = ""
+        result = capture_mod._postprocess_text("[Sergey] Hello world", "[12:00:00-12:00:10]")
+        assert "[Sergey]" in result
+        assert "Hello world" in result
+
+    def test_postprocess_continuation_with_named_speaker(self):
+        """Same named speaker on consecutive chunks shows continuation."""
+        capture_mod._prev_speaker = ""
+        capture_mod._prev_chunks.clear()
+        capture_mod._postprocess_text("[Sergey] First part", "[12:00:00-12:00:10]")
+        result = capture_mod._postprocess_text("[Sergey] Second part", "[12:00:10-12:00:20]")
+        assert result.startswith("...")
+
+    def test_postprocess_speaker_change_named_to_you(self):
+        """Change from named speaker to [You] shows new label."""
+        capture_mod._prev_speaker = ""
+        capture_mod._prev_chunks.clear()
+        capture_mod._postprocess_text("[Sergey] His text", "[12:00:00-12:00:10]")
+        result = capture_mod._postprocess_text("[You] My text", "[12:00:10-12:00:20]")
+        assert result.startswith("[You]")
+
+    def _run_one_poll(self, mock_result):
+        """Run _poll_participants for exactly one iteration."""
+        call_count = [0]
+        original_wait = capture_mod.shutdown_event.wait
+
+        def one_shot_wait(timeout=None):
+            call_count[0] += 1
+            if call_count[0] >= 1:
+                capture_mod.shutdown_event.set()
+            return original_wait(timeout=0)
+
+        with patch("capture.subprocess.run", return_value=mock_result), \
+             patch.object(capture_mod.shutdown_event, "wait", side_effect=one_shot_wait):
+            capture_mod.shutdown_event.clear()
+            capture_mod._poll_participants()
+            capture_mod.shutdown_event.clear()
+
+    def test_poll_participants_subprocess_failure(self):
+        """Poll should handle subprocess failures gracefully."""
+        with capture_mod._participants_lock:
+            capture_mod._participants.extend(["Alice"])
+        mock_result = MagicMock(returncode=1, stdout=b"")
+        self._run_one_poll(mock_result)
+        assert capture_mod.get_participants() == ["Alice"]
+
+    def test_poll_participants_updates_list(self):
+        """Successful poll updates participant list."""
+        mock_result = MagicMock(returncode=0, stdout=b'["Bob", "Charlie"]')
+        self._run_one_poll(mock_result)
+        assert capture_mod.get_participants() == ["Bob", "Charlie"]
+
+    def test_poll_participants_invalid_json(self):
+        """Invalid JSON should not crash or clear participants."""
+        with capture_mod._participants_lock:
+            capture_mod._participants.extend(["Alice"])
+        mock_result = MagicMock(returncode=0, stdout=b'not json')
+        self._run_one_poll(mock_result)
+        assert capture_mod.get_participants() == ["Alice"]

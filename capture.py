@@ -36,6 +36,7 @@ CAPTURE_MODE = os.environ.get("CAPTURE_MODE", "coreaudio")  # "coreaudio" or "le
 BUNDLE_ID = os.environ.get("BUNDLE_ID", "us.zoom.xos")
 
 AUDIO_TAP_BIN = Path(__file__).parent / ".build" / "process-audio-tap"
+PARTICIPANTS_BIN = Path(__file__).parent / ".build" / "zoom-participants"
 ENABLE_LLM_POST = os.environ.get("LLM_POST", "1") == "1"
 
 # Bounded queues
@@ -43,6 +44,48 @@ audio_queue = queue.Queue(maxsize=MAX_QUEUE_CHUNKS)
 mic_queue = queue.Queue(maxsize=MAX_QUEUE_CHUNKS)
 shutdown_event = threading.Event()
 error_event = threading.Event()
+
+
+# -- Zoom participant names ---------------------------------------------------
+
+_participants: list[str] = []  # current meeting participants (excluding self)
+_participants_lock = threading.Lock()
+
+
+def _poll_participants():
+    """Background thread: poll Zoom participants via Accessibility API."""
+    import json as _json
+    while not shutdown_event.is_set():
+        try:
+            r = subprocess.run(
+                [str(PARTICIPANTS_BIN)],
+                capture_output=True, timeout=5,
+            )
+            if r.returncode == 0 and r.stdout.strip():
+                names = _json.loads(r.stdout)
+                if isinstance(names, list):
+                    with _participants_lock:
+                        _participants.clear()
+                        _participants.extend(names)
+                    if names:
+                        print(f"[meeting] Participants: {', '.join(names)}", flush=True)
+        except Exception:
+            pass
+        shutdown_event.wait(timeout=10)
+
+
+def get_participants() -> list[str]:
+    """Get current participant list (thread-safe)."""
+    with _participants_lock:
+        return list(_participants)
+
+
+def get_remote_participants() -> list[str]:
+    """Get participants excluding self (user config name or common self-markers)."""
+    all_p = get_participants()
+    # The user is typically marked with "(Me)" or "(Я)" which is stripped by the Swift CLI.
+    # For now return all — the user's own name will be labeled [You] via energy diarization.
+    return all_p
 
 
 # -- Speaker diarization -----------------------------------------------------
@@ -82,6 +125,14 @@ def _classify_speakers(audio_bh: np.ndarray, audio_mic: np.ndarray,
     return merged
 
 
+def _remote_label() -> str:
+    """Get the label for remote speaker(s). Uses participant names if available."""
+    participants = get_remote_participants()
+    if len(participants) == 1:
+        return f"[{participants[0]}]"
+    return "[Remote]"
+
+
 def _build_diarized_text(text: str, segments: list[tuple[str, int, int]],
                          audio_len: int) -> str:
     if not segments:
@@ -96,9 +147,13 @@ def _build_diarized_text(text: str, segments: list[tuple[str, int, int]],
         if you_pct > 0.7:
             return f"[You] {text}"
         elif you_pct < 0.3:
-            return f"[Remote] {text}"
+            remote = _remote_label()
+            return f"{remote} {text}"
         else:
-            return f"[You + Remote] {text}"
+            remote = _remote_label()
+            return f"[You + {remote.strip('[]')}] {text}"
+    if dominant == "[Remote]":
+        dominant = _remote_label()
     return f"{dominant} {text}"
 
 
@@ -229,11 +284,12 @@ def _postprocess_text(text: str, timestamp: str) -> str:
     # Phase 1: Rule-based speaker continuity
     current_speaker = ""
     clean_text = text
-    for label in ["[You + Remote]", "[You]", "[Remote]"]:
-        if text.startswith(label):
-            current_speaker = label
-            clean_text = text[len(label):].strip()
-            break
+    # Check for speaker labels: [You], [Remote], [Name], [You + Name]
+    if text.startswith("["):
+        bracket_end = text.find("]")
+        if bracket_end != -1:
+            current_speaker = text[:bracket_end + 1]
+            clean_text = text[bracket_end + 1:].strip()
 
     # If same speaker as last chunk and no pause, mark as continuation
     show_label = True
@@ -248,13 +304,24 @@ def _postprocess_text(text: str, timestamp: str) -> str:
         try:
             from mlx_lm import generate
             context = "\n".join(_prev_chunks[-3:])
+
+            # Build participant-aware prompt
+            participants = get_remote_participants()
+            participant_hint = ""
+            if participants:
+                names = ", ".join(participants)
+                participant_hint = f"""- Meeting participants: {names}
+- If you can identify who is speaking from context, prefix with [Name]
+- If multiple speakers in one chunk, split with newlines: [Name1] text\\n[Name2] text
+"""
+
             prompt = f"""Fix this speech-to-text transcript chunk using the context. Rules:
 - Fix obvious recognition errors based on context
 - If chunk starts mid-sentence (continuing previous), merge naturally
 - Keep it concise, output ONLY the corrected text
 - Keep the same language as input
 - Do NOT add anything not in the original
-
+{participant_hint}
 Context:
 {context}
 
@@ -631,6 +698,13 @@ def main():
     if has_mic:
         threading.Thread(target=mute_monitor_thread, daemon=True).start()
         print("[meeting] Zoom mute monitor active — mic silenced when muted", flush=True)
+
+    # Start participant name detection (Accessibility API)
+    if PARTICIPANTS_BIN.exists():
+        threading.Thread(target=_poll_participants, daemon=True).start()
+        print("[meeting] Participant detection active", flush=True)
+    else:
+        print("[meeting] zoom-participants binary not found, using generic [Remote] labels", flush=True)
 
     # Verify whisper.cpp is available
     model = None  # not used — whisper-cli is called as subprocess
