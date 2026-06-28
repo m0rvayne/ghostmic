@@ -12,3 +12,6 @@ transcripts/
 watcher.log
 .DS_Store
 launch/
+ROADMAP*.md
+uv.lock
+process-audio-tap

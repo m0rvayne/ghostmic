@@ -371,3 +371,64 @@ class TestWriteStatus:
         data = json.loads(path.read_text())
         assert set(data.keys()) == {"state", "transcript", "timestamp"}
         assert before <= data["timestamp"] <= after
+
+
+class TestWhisperServerLifecycle:
+    """Test whisper-server start/stop in watcher."""
+
+    def test_context_has_whisper_server_field(self, config):
+        ctx = watcher.WatcherContext(config=config)
+        assert ctx.whisper_server_process is None
+
+    def test_server_healthy_false_when_not_running(self):
+        assert watcher._whisper_server_healthy() is False
+
+    def test_start_whisper_server_skips_if_healthy(self, config):
+        ctx = watcher.WatcherContext(config=config)
+        with patch.object(watcher, "_whisper_server_healthy", return_value=True):
+            watcher.start_whisper_server(ctx)
+        assert ctx.whisper_server_process is None
+
+    def test_start_whisper_server_skips_if_not_found(self, config):
+        ctx = watcher.WatcherContext(config=config)
+        mock_result = MagicMock(returncode=1, stdout="")
+        with patch.object(watcher, "_whisper_server_healthy", return_value=False), \
+             patch.object(watcher.subprocess, "run", return_value=mock_result):
+            watcher.start_whisper_server(ctx)
+        assert ctx.whisper_server_process is None
+
+    def test_stop_whisper_server_terminates(self, config):
+        ctx = watcher.WatcherContext(config=config)
+        mock_proc = MagicMock()
+        mock_proc.poll.return_value = None  # still running
+        mock_proc.wait.return_value = 0
+        ctx.whisper_server_process = mock_proc
+        watcher.stop_whisper_server(ctx)
+        mock_proc.terminate.assert_called_once()
+        assert ctx.whisper_server_process is None
+
+    def test_stop_whisper_server_kills_on_timeout(self, config):
+        import subprocess as sp
+        ctx = watcher.WatcherContext(config=config)
+        mock_proc = MagicMock()
+        mock_proc.poll.return_value = None
+        mock_proc.wait.side_effect = sp.TimeoutExpired(cmd="whisper-server", timeout=5)
+        ctx.whisper_server_process = mock_proc
+        watcher.stop_whisper_server(ctx)
+        mock_proc.kill.assert_called_once()
+        assert ctx.whisper_server_process is None
+
+    def test_stop_whisper_server_noop_when_none(self, config):
+        ctx = watcher.WatcherContext(config=config)
+        ctx.whisper_server_process = None
+        watcher.stop_whisper_server(ctx)  # should not raise
+
+    def test_shutdown_stops_whisper_server(self, config):
+        """Main loop shutdown should stop whisper-server."""
+        ctx = watcher.WatcherContext(config=config)
+        mock_proc = MagicMock()
+        mock_proc.poll.return_value = None
+        mock_proc.wait.return_value = 0
+        ctx.whisper_server_process = mock_proc
+        watcher.stop_whisper_server(ctx)
+        mock_proc.terminate.assert_called_once()

@@ -100,6 +100,7 @@ class WatcherContext:
     crash_times: list[float] = field(default_factory=list)
     backoff_until: Optional[float] = None
     running: bool = True
+    whisper_server_process: Optional[subprocess.Popen] = None
 
 
 # --------------------------------------------------------------------------
@@ -238,6 +239,90 @@ def update_symlink(config: WatcherConfig, target: Path):
 
 
 # --------------------------------------------------------------------------
+# Whisper-server lifecycle
+# --------------------------------------------------------------------------
+
+WHISPER_SERVER_PORT = 8178
+
+
+def _whisper_server_healthy() -> bool:
+    """Check if whisper-server is responding."""
+    try:
+        import urllib.request
+        req = urllib.request.Request(
+            f"http://127.0.0.1:{WHISPER_SERVER_PORT}/health", method="GET")
+        with urllib.request.urlopen(req, timeout=2) as resp:
+            return resp.status == 200
+    except Exception:
+        return False
+
+
+def start_whisper_server(ctx: WatcherContext):
+    """Start whisper-server if not already running. Model stays in memory."""
+    if _whisper_server_healthy():
+        logger.info("whisper-server already running")
+        return
+
+    # Find whisper-server binary
+    try:
+        r = subprocess.run(["which", "whisper-server"], capture_output=True, text=True)
+        if r.returncode != 0:
+            logger.warning("whisper-server not found, using whisper-cli (slower)")
+            return
+    except Exception:
+        return
+
+    server_bin = r.stdout.strip()
+    user_cfg = _load_user_config(ctx.config.install_dir)
+    model_path = os.environ.get("WHISPER_MODEL_PATH",
+        str(ctx.config.install_dir / "models" / "ggml-large-v3-turbo.bin"))
+    language = user_cfg.get("language", os.environ.get("LANGUAGE", "ru"))
+
+    cmd = [
+        server_bin,
+        "-m", model_path,
+        "--host", "127.0.0.1",
+        "--port", str(WHISPER_SERVER_PORT),
+        "-t", "4",
+        "--convert",
+    ]
+    if language and language != "auto":
+        cmd.extend(["-l", language])
+
+    log_path = ctx.config.install_dir / "whisper-server.log"
+    log_file = open(log_path, "a")
+
+    ctx.whisper_server_process = subprocess.Popen(
+        cmd, stdout=log_file, stderr=log_file,
+    )
+    logger.info(f"whisper-server started (PID {ctx.whisper_server_process.pid}, port {WHISPER_SERVER_PORT})")
+
+    # Wait for server to be ready (model loading takes a few seconds)
+    for _ in range(30):  # up to 30s
+        time.sleep(1)
+        if _whisper_server_healthy():
+            logger.info("whisper-server ready (model loaded)")
+            return
+        if ctx.whisper_server_process.poll() is not None:
+            logger.error(f"whisper-server exited with code {ctx.whisper_server_process.returncode}")
+            ctx.whisper_server_process = None
+            return
+    logger.warning("whisper-server did not become healthy in 30s")
+
+
+def stop_whisper_server(ctx: WatcherContext):
+    """Stop whisper-server if we started it."""
+    if ctx.whisper_server_process and ctx.whisper_server_process.poll() is None:
+        ctx.whisper_server_process.terminate()
+        try:
+            ctx.whisper_server_process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            ctx.whisper_server_process.kill()
+        logger.info("whisper-server stopped")
+    ctx.whisper_server_process = None
+
+
+# --------------------------------------------------------------------------
 # Capture lifecycle
 # --------------------------------------------------------------------------
 
@@ -261,8 +346,12 @@ def start_capture(ctx: WatcherContext):
     update_symlink(config, ctx.current_transcript)
     write_status(config, "RECORDING", ctx.current_transcript.name)
 
+    # Start whisper-server if not running (model stays in memory)
+    start_whisper_server(ctx)
+
     env = os.environ.copy()
     env["TRANSCRIPT_FILE"] = str(ctx.current_transcript)
+    env["WHISPER_SERVER_PORT"] = str(WHISPER_SERVER_PORT)
 
     # Read user config for whisper model and diarization
     user_cfg = _load_user_config(config.install_dir)
@@ -450,6 +539,7 @@ def main():
     logger.info("Shutting down watcher...")
     if ctx.capture_process and ctx.capture_process.poll() is None:
         stop_capture(ctx)
+    stop_whisper_server(ctx)
     write_status(config, "IDLE")
 
 

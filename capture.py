@@ -160,8 +160,12 @@ def _build_diarized_text(text: str, segments: list[tuple[str, int, int]],
 # -- Transcription (whisper.cpp with Metal GPU) --------------------------------
 
 WHISPER_CLI = os.environ.get("WHISPER_CLI", "whisper-cli")
+WHISPER_SERVER_BIN = os.environ.get("WHISPER_SERVER", "whisper-server")
 WHISPER_MODEL_PATH = os.environ.get("WHISPER_MODEL_PATH",
     str(Path(__file__).parent / "models" / "ggml-large-v3-turbo.bin"))
+WHISPER_SERVER_HOST = os.environ.get("WHISPER_SERVER_HOST", "127.0.0.1")
+WHISPER_SERVER_PORT = int(os.environ.get("WHISPER_SERVER_PORT", "8178"))
+_whisper_server_available = False  # set True after successful health check
 
 
 def format_time(dt: datetime) -> str:
@@ -195,31 +199,84 @@ def _is_hallucination(text: str) -> bool:
     return False
 
 
-def transcribe_chunk(model_unused, audio_np: np.ndarray) -> str:
-    """Transcribe audio using whisper.cpp CLI with Metal GPU acceleration."""
-    # Skip very quiet audio — prevents hallucinations on silence
-    rms = np.sqrt(np.mean(audio_np ** 2))
-    if rms < MIN_SPEECH_RMS:
-        return ""
+def _audio_to_wav_bytes(audio_np: np.ndarray) -> bytes:
+    """Convert float32 numpy audio to WAV bytes (16-bit PCM, 16kHz, mono)."""
+    import struct
+    pcm = (audio_np * 32768).clip(-32768, 32767).astype(np.int16).tobytes()
+    # Build WAV header manually — avoids ffmpeg dependency for server mode
+    data_size = len(pcm)
+    header = struct.pack('<4sI4s4sIHHIIHH4sI',
+        b'RIFF', 36 + data_size, b'WAVE',
+        b'fmt ', 16, 1, 1, SAMPLE_RATE, SAMPLE_RATE * 2, 2, 16,
+        b'data', data_size)
+    return header + pcm
 
-    lang = LANGUAGE if LANGUAGE != "auto" else "auto"
 
+def _check_whisper_server() -> bool:
+    """Check if whisper-server is healthy."""
+    global _whisper_server_available
+    try:
+        import urllib.request
+        url = f"http://{WHISPER_SERVER_HOST}:{WHISPER_SERVER_PORT}/health"
+        req = urllib.request.Request(url, method="GET")
+        with urllib.request.urlopen(req, timeout=2) as resp:
+            if resp.status == 200:
+                _whisper_server_available = True
+                return True
+    except Exception:
+        pass
+    _whisper_server_available = False
+    return False
+
+
+def _transcribe_via_server(wav_bytes: bytes, lang: str) -> str:
+    """Transcribe via whisper-server HTTP API. Model stays in memory."""
+    import urllib.request
+    import json as _json
+
+    url = f"http://{WHISPER_SERVER_HOST}:{WHISPER_SERVER_PORT}/inference"
+    boundary = "----GhostmicBoundary"
+
+    # Build multipart/form-data body
+    parts = []
+    # File part
+    parts.append(f"--{boundary}\r\n"
+                 f"Content-Disposition: form-data; name=\"file\"; filename=\"chunk.wav\"\r\n"
+                 f"Content-Type: audio/wav\r\n\r\n")
+    # Form fields
+    fields = {"response_format": "json", "temperature": "0.0", "beam_size": "1"}
+    if lang != "auto":
+        fields["language"] = lang
+
+    body = b""
+    body += parts[0].encode()
+    body += wav_bytes
+    body += b"\r\n"
+    for key, val in fields.items():
+        body += f"--{boundary}\r\nContent-Disposition: form-data; name=\"{key}\"\r\n\r\n{val}\r\n".encode()
+    body += f"--{boundary}--\r\n".encode()
+
+    req = urllib.request.Request(url, data=body, method="POST")
+    req.add_header("Content-Type", f"multipart/form-data; boundary={boundary}")
+
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        result = _json.loads(resp.read())
+        return result.get("text", "").strip()
+
+
+def _transcribe_via_cli(audio_np: np.ndarray, lang: str) -> str:
+    """Transcribe via whisper-cli subprocess. Model loaded each time."""
     import tempfile
 
-    # Convert float32 audio to int16 PCM
     pcm_data = (audio_np * 32768).astype(np.int16).tobytes()
-
-    # Write to temp WAV file (whisper-cli can't read WAV from stdin pipe)
     tmp_wav = os.path.join(tempfile.gettempdir(), "ghostmic-chunk.wav")
 
     try:
-        # PCM → WAV via ffmpeg
         subprocess.run(
             ["ffmpeg", "-y", "-f", "s16le", "-ar", "16000", "-ac", "1", "-i", "pipe:0", tmp_wav],
             input=pcm_data, capture_output=True, timeout=10,
         )
 
-        # Transcribe WAV file
         whisper_cmd = [
             WHISPER_CLI,
             "-m", WHISPER_MODEL_PATH,
@@ -232,25 +289,43 @@ def transcribe_chunk(model_unused, audio_np: np.ndarray) -> str:
 
         r = subprocess.run(whisper_cmd, capture_output=True, timeout=30)
         text = r.stdout.decode("utf-8", errors="replace").strip()
-
-        # Clean up whisper output
         text = text.replace("[BLANK_AUDIO]", "").strip()
         lines = [l.strip() for l in text.split("\n") if l.strip() and not l.strip().startswith("[")]
-        text = " ".join(lines).strip()
-
-        # Filter hallucinations
-        if _is_hallucination(text):
-            text = ""
+        return " ".join(lines).strip()
 
     except Exception as e:
-        print(f"[meeting] Transcription error: {e}", file=sys.stderr, flush=True)
-        text = ""
+        print(f"[meeting] CLI transcription error: {e}", file=sys.stderr, flush=True)
+        return ""
     finally:
         try:
             os.unlink(tmp_wav)
         except OSError:
             pass
 
+
+def transcribe_chunk(model_unused, audio_np: np.ndarray) -> str:
+    """Transcribe audio using whisper-server (preferred) or whisper-cli (fallback)."""
+    rms = np.sqrt(np.mean(audio_np ** 2))
+    if rms < MIN_SPEECH_RMS:
+        return ""
+
+    lang = LANGUAGE if LANGUAGE != "auto" else "auto"
+    text = ""
+
+    # Try whisper-server first (model in memory, ~10x faster)
+    if _whisper_server_available:
+        try:
+            wav_bytes = _audio_to_wav_bytes(audio_np)
+            text = _transcribe_via_server(wav_bytes, lang)
+        except Exception as e:
+            print(f"[meeting] Server transcription failed, falling back to CLI: {e}",
+                  file=sys.stderr, flush=True)
+            text = _transcribe_via_cli(audio_np, lang)
+    else:
+        text = _transcribe_via_cli(audio_np, lang)
+
+    if _is_hallucination(text):
+        return ""
     return text
 
 
@@ -706,19 +781,22 @@ def main():
     else:
         print("[meeting] zoom-participants binary not found, using generic [Remote] labels", flush=True)
 
-    # Verify whisper.cpp is available
-    model = None  # not used — whisper-cli is called as subprocess
-    try:
-        r = subprocess.run([WHISPER_CLI, "--help"], capture_output=True, timeout=5)
-        print(f"[meeting] whisper.cpp ready (Metal GPU)", flush=True)
-    except FileNotFoundError:
-        print(f"[meeting] ERROR: whisper-cli not found. Install: brew install whisper-cpp", file=sys.stderr)
-        sys.exit(1)
+    # Check whisper-server first, then fall back to whisper-cli
+    model = None  # not used — whisper-server/cli handles model
+    if _check_whisper_server():
+        print(f"[meeting] whisper-server ready at :{WHISPER_SERVER_PORT} (model in memory, Metal GPU)", flush=True)
+    else:
+        try:
+            subprocess.run([WHISPER_CLI, "--help"], capture_output=True, timeout=5)
+            print(f"[meeting] whisper-cli ready (Metal GPU) — consider whisper-server for faster transcription", flush=True)
+        except FileNotFoundError:
+            print(f"[meeting] ERROR: neither whisper-server nor whisper-cli found. Install: brew install whisper-cpp", file=sys.stderr)
+            sys.exit(1)
 
-    if not Path(WHISPER_MODEL_PATH).exists():
-        print(f"[meeting] ERROR: Model not found: {WHISPER_MODEL_PATH}", file=sys.stderr)
-        print(f"[meeting] Download: curl -L -o {WHISPER_MODEL_PATH} https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3-turbo.bin", file=sys.stderr)
-        sys.exit(1)
+        if not Path(WHISPER_MODEL_PATH).exists():
+            print(f"[meeting] ERROR: Model not found: {WHISPER_MODEL_PATH}", file=sys.stderr)
+            print(f"[meeting] Download: curl -L -o {WHISPER_MODEL_PATH} https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3-turbo.bin", file=sys.stderr)
+            sys.exit(1)
 
     print(f"[meeting] Model: {Path(WHISPER_MODEL_PATH).name}, Language: {LANGUAGE}", flush=True)
 

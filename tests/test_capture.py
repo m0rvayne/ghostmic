@@ -750,3 +750,103 @@ class TestParticipantDetection:
         mock_result = MagicMock(returncode=0, stdout=b'not json')
         self._run_one_poll(mock_result)
         assert capture_mod.get_participants() == ["Alice"]
+
+
+class TestWhisperServer:
+    """Test whisper-server integration and fallback logic."""
+
+    def test_audio_to_wav_bytes_valid_wav(self):
+        """Generated WAV bytes should have valid RIFF/WAV header."""
+        audio = np.zeros(16000, dtype=np.float32)  # 1 second of silence
+        wav = capture_mod._audio_to_wav_bytes(audio)
+        assert wav[:4] == b'RIFF'
+        assert wav[8:12] == b'WAVE'
+        assert wav[12:16] == b'fmt '
+        assert wav[36:40] == b'data'
+
+    def test_audio_to_wav_bytes_correct_size(self):
+        """WAV data section should match PCM size."""
+        audio = np.ones(8000, dtype=np.float32) * 0.5
+        wav = capture_mod._audio_to_wav_bytes(audio)
+        import struct
+        data_size = struct.unpack_from('<I', wav, 40)[0]
+        assert data_size == 8000 * 2  # int16 = 2 bytes per sample
+
+    def test_audio_to_wav_bytes_clipping(self):
+        """Values beyond [-1, 1] should be clipped, not overflow."""
+        audio = np.array([2.0, -2.0, 0.5], dtype=np.float32)
+        wav = capture_mod._audio_to_wav_bytes(audio)
+        # Should not raise, WAV should be valid
+        assert len(wav) == 44 + 3 * 2  # header + 3 samples * 2 bytes
+
+    def test_check_whisper_server_not_running(self):
+        """Health check should return False when server is not running."""
+        result = capture_mod._check_whisper_server()
+        # Server is not running in test environment
+        assert result is False
+        assert capture_mod._whisper_server_available is False
+
+    def test_check_whisper_server_mock_healthy(self):
+        """Health check should return True for healthy server."""
+        import urllib.request
+        mock_resp = MagicMock()
+        mock_resp.status = 200
+        mock_resp.__enter__ = lambda s: s
+        mock_resp.__exit__ = MagicMock(return_value=False)
+        with patch("urllib.request.urlopen", return_value=mock_resp):
+            result = capture_mod._check_whisper_server()
+        assert result is True
+        assert capture_mod._whisper_server_available is True
+        # Reset
+        capture_mod._whisper_server_available = False
+
+    def test_transcribe_chunk_fallback_to_cli(self):
+        """When server unavailable, should fall back to CLI."""
+        capture_mod._whisper_server_available = False
+        audio = np.random.randn(16000).astype(np.float32) * 0.1
+        with patch.object(capture_mod, '_transcribe_via_cli', return_value="test text") as mock_cli:
+            result = capture_mod.transcribe_chunk(None, audio)
+        mock_cli.assert_called_once()
+        assert result == "test text"
+
+    def test_transcribe_chunk_uses_server_when_available(self):
+        """When server available, should use HTTP API."""
+        capture_mod._whisper_server_available = True
+        audio = np.random.randn(16000).astype(np.float32) * 0.1
+        with patch.object(capture_mod, '_transcribe_via_server', return_value="server text") as mock_srv, \
+             patch.object(capture_mod, '_transcribe_via_cli') as mock_cli:
+            result = capture_mod.transcribe_chunk(None, audio)
+        mock_srv.assert_called_once()
+        mock_cli.assert_not_called()
+        assert result == "server text"
+        capture_mod._whisper_server_available = False
+
+    def test_transcribe_chunk_server_error_falls_back(self):
+        """Server error should trigger CLI fallback."""
+        capture_mod._whisper_server_available = True
+        audio = np.random.randn(16000).astype(np.float32) * 0.1
+        with patch.object(capture_mod, '_transcribe_via_server', side_effect=Exception("connection refused")), \
+             patch.object(capture_mod, '_transcribe_via_cli', return_value="cli fallback") as mock_cli:
+            result = capture_mod.transcribe_chunk(None, audio)
+        mock_cli.assert_called_once()
+        assert result == "cli fallback"
+        capture_mod._whisper_server_available = False
+
+    def test_transcribe_chunk_silence_skipped(self):
+        """Very quiet audio should be skipped regardless of mode."""
+        capture_mod._whisper_server_available = True
+        audio = np.zeros(16000, dtype=np.float32)  # pure silence
+        with patch.object(capture_mod, '_transcribe_via_server') as mock_srv:
+            result = capture_mod.transcribe_chunk(None, audio)
+        mock_srv.assert_not_called()
+        assert result == ""
+        capture_mod._whisper_server_available = False
+
+    def test_transcribe_chunk_hallucination_filtered(self):
+        """Server result that is a hallucination should be filtered."""
+        capture_mod._whisper_server_available = True
+        audio = np.random.randn(16000).astype(np.float32) * 0.1
+        with patch.object(capture_mod, '_transcribe_via_server', return_value="Продолжение следует"):
+            result = capture_mod.transcribe_chunk(None, audio)
+        assert result == ""
+        capture_mod._whisper_server_available = False
