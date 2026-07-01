@@ -276,6 +276,48 @@ class TestTickSequences:
         assert ctx.state == watcher.State.BACKOFF
 
 
+class TestCrashedCaptureDetection:
+    """Test that crashed capture processes are detected and trigger backoff."""
+
+    def test_crashed_capture_triggers_stop(self, ctx):
+        """If capture process died between ticks, stop_capture should be called."""
+        proc = _mock_popen()
+        proc.poll.return_value = 1  # process already exited
+        proc.returncode = 1
+        ctx.capture_process = proc
+        ctx.state = watcher.State.RECORDING
+        ctx.current_transcript = ctx.config.transcripts_dir / "test.txt"
+        ctx.current_transcript.touch()
+
+        with patch.object(watcher, "is_in_conference", return_value=True), \
+             patch.object(watcher, "start_capture"):
+            watcher.tick(ctx)
+
+        # crash_times should have been recorded
+        assert len(ctx.crash_times) == 1
+
+    def test_repeated_crashes_trigger_backoff(self, ctx):
+        """3 rapid crashes should trigger backoff state."""
+        for _ in range(3):
+            proc = _mock_popen()
+            proc.poll.return_value = 1
+            proc.returncode = 1
+            ctx.capture_process = proc
+            ctx.state = watcher.State.RECORDING
+            ctx.current_transcript = ctx.config.transcripts_dir / "test.txt"
+            ctx.current_transcript.touch()
+
+            with patch.object(watcher, "is_in_conference", return_value=True), \
+                 patch.object(watcher, "update_symlink"), \
+                 patch.object(watcher, "start_whisper_server"), \
+                 patch.object(watcher, "write_status"), \
+                 patch("subprocess.Popen") as mock_popen:
+                mock_popen.return_value = _mock_popen()
+                watcher.tick(ctx)
+
+        assert ctx.state == watcher.State.BACKOFF
+
+
 class TestControlCommands:
     """Tests for _read_control() — reading and consuming control JSON."""
 

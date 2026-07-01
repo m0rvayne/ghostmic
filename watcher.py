@@ -508,6 +508,11 @@ def tick(ctx: WatcherContext):
         and ctx.capture_process.poll() is None
     )
 
+    # Detect crashed capture process (exited but not cleaned up via stop_capture)
+    if ctx.capture_process is not None and not is_recording:
+        logger.warning(f"Capture process died (exit code {ctx.capture_process.returncode})")
+        stop_capture(ctx)  # records crash_time for backoff
+
     if in_conf:
         if ctx.state == State.GRACE_PERIOD and is_recording:
             # Conference came back during grace period — this could be a reconnect
