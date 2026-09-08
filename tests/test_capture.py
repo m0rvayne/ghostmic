@@ -4,6 +4,7 @@ import queue
 import subprocess
 import sys
 import threading
+import types
 from unittest.mock import MagicMock, patch, PropertyMock
 import numpy as np
 import pytest
@@ -979,3 +980,89 @@ class TestStaleBufferFlush:
     def test_tap_silence_timeout_defined(self):
         assert hasattr(capture_mod, 'TAP_SILENCE_TIMEOUT')
         assert capture_mod.TAP_SILENCE_TIMEOUT > 0
+
+
+class TestStripHallucinations:
+    """Regression tests: every string below was observed leaking into real
+    transcripts. Whole-chunk dropping also lost genuine speech — check both."""
+
+    @pytest.mark.parametrize("text", [
+        "ПОДПИШИСЬ НА КАНАЛ",
+        "Субтитры делал DimaTorzok",
+        "Субтитры сделал DimaTorzok",
+        "Субтитры создавал DimaTorzok",
+        "Добавил субтитры DimaTorzok",
+        "ДИНАМИЧНАЯ МУЗЫКА",
+        "Играет музыка.",
+        "*Играет музыка* *Играет музыка*",
+        "[МУЗЫКА]",
+        "Продолжение следует...",
+    ])
+    def test_observed_leak_is_removed(self, text):
+        stripped = capture_mod._strip_hallucinations(text)
+        assert capture_mod._is_hallucination(stripped) is True
+
+    def test_real_speech_survives_trailing_outro(self):
+        text = "Давайте обсудим бюджет. Продолжение следует..."
+        stripped = capture_mod._strip_hallucinations(text)
+        assert stripped == "Давайте обсудим бюджет."
+        assert capture_mod._is_hallucination(stripped) is False
+
+    def test_real_speech_untouched(self):
+        text = "Давайте обсудим план проекта на следующий квартал."
+        assert capture_mod._strip_hallucinations(text) == text
+
+    def test_sound_event_removed_mid_sentence(self):
+        text = "Мы решили перенести релиз (смех) на понедельник."
+        assert capture_mod._strip_hallucinations(text) == "Мы решили перенести релиз на понедельник."
+
+    def test_parenthetical_speech_is_kept(self):
+        text = "Он сказал (я цитирую дословно) что сроки сдвигаются."
+        assert capture_mod._strip_hallucinations(text) == text
+
+    def test_empty_input(self):
+        assert capture_mod._strip_hallucinations("") == ""
+
+
+class TestLLMGenerateArgs:
+    """The `temp=` kwarg silently broke LLM post-processing for months —
+    generate() must be called with a sampler, never with temp."""
+
+    def test_generate_called_without_temp_kwarg(self, monkeypatch):
+        captured = {}
+
+        def fake_generate(model, tokenizer, prompt=None, **kwargs):
+            captured.update(kwargs)
+            return "result"
+
+        monkeypatch.setattr(capture_mod, "_llm_model", object())
+        monkeypatch.setattr(capture_mod, "_llm_tokenizer", object())
+        monkeypatch.setattr(capture_mod, "_llm_sampler", None)
+        monkeypatch.setitem(sys.modules, "mlx_lm", types.SimpleNamespace(generate=fake_generate))
+        monkeypatch.setitem(sys.modules, "mlx_lm.sample_utils",
+                            types.SimpleNamespace(make_sampler=lambda **kw: "sampler-obj"))
+
+        assert capture_mod._llm_generate("prompt") == "result"
+        assert "temp" not in captured
+        assert captured.get("sampler") == "sampler-obj"
+
+    def test_falls_back_to_greedy_when_sampler_api_missing(self, monkeypatch):
+        captured = {}
+
+        def fake_generate(model, tokenizer, prompt=None, **kwargs):
+            captured.update(kwargs)
+            return "result"
+
+        def boom(**kwargs):
+            raise ImportError("no sample_utils")
+
+        monkeypatch.setattr(capture_mod, "_llm_model", object())
+        monkeypatch.setattr(capture_mod, "_llm_tokenizer", object())
+        monkeypatch.setattr(capture_mod, "_llm_sampler", None)
+        monkeypatch.setitem(sys.modules, "mlx_lm", types.SimpleNamespace(generate=fake_generate))
+        monkeypatch.setitem(sys.modules, "mlx_lm.sample_utils",
+                            types.SimpleNamespace(make_sampler=boom))
+
+        assert capture_mod._llm_generate("prompt") == "result"
+        assert "sampler" not in captured
+        assert "temp" not in captured

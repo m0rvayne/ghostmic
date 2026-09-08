@@ -14,6 +14,7 @@ Two capture modes:
 import sys
 import os
 import queue
+import re
 import signal
 import subprocess
 import time
@@ -215,12 +216,21 @@ def format_time(dt: datetime) -> str:
     return dt.strftime("%H:%M:%S")
 
 
-# Known Whisper hallucination patterns (appears on silence/quiet audio)
+# Known Whisper hallucination patterns (appears on silence/quiet audio).
+# Verified against 1300+ real transcripts — every RU entry below was observed
+# leaking into production output.
 _HALLUCINATION_PATTERNS = [
-    # RU
-    "продолжение следует", "субтитры сделал", "спасибо за просмотр",
-    "подписывайтесь на канал", "ставьте лайк", "до новых встреч",
-    "редактор субтитров", "корректор",
+    # RU — subtitle credits (Whisper was trained on subtitled video).
+    # "спасибо за субтитры" alone accounted for 175 leaks in the archive.
+    "продолжение следует", "субтитры сделал", "субтитры делал",
+    "субтитры создавал", "добавил субтитры", "субтитры и перевод",
+    "спасибо за субтитры", "редактор субтитров", "корректор",
+    "dimatorzok", "дубровскому",
+    # RU — channel outros
+    "спасибо за просмотр", "подписывайтесь на канал", "подпишись на канал",
+    "ставьте лайк", "до новых встреч",
+    # RU — sound annotations emitted as plain text
+    "динамичная музыка", "играет музыка", "музыка играет", "звучит музыка",
     # EN
     "thanks for watching", "subscribe", "like and subscribe",
     "see you next time", "please subscribe", "thank you for watching",
@@ -234,6 +244,51 @@ _HALLUCINATION_PATTERNS = [
     # ZH / JA
     "谢谢观看", "请订阅", "ご視聴ありがとう",
 ]
+
+# Non-speech events Whisper brackets instead of transcribing: *музыка*, [MUSIC], (смех)
+_SOUND_EVENT_WORDS = (
+    "музык", "смех", "аплодисмент", "шум", "тишин", "звук", "вздох", "кашель",
+    "music", "laugh", "applause", "silence", "noise", "blank_audio", "inaudible",
+)
+_ASTERISK_ANNOTATION_RE = re.compile(r"\*[^*]{0,60}\*")
+_BRACKET_ANNOTATION_RE = re.compile(r"[\[(]([^\[\]()]{0,60})[\])]")
+_SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?…])\s+")
+
+
+def _looks_like_sound_event(inner: str) -> bool:
+    """True if bracketed text is a sound annotation, not speech."""
+    stripped = inner.strip()
+    if not stripped or len(stripped.split()) > 5:
+        return False
+    low = stripped.lower()
+    if any(w in low for w in _SOUND_EVENT_WORDS):
+        return True
+    # ALL-CAPS bracketed text is an annotation, never speech
+    return stripped.isupper() and any(c.isalpha() for c in stripped)
+
+
+def _strip_hallucinations(text: str) -> str:
+    """Remove canned phrases and sound annotations while keeping real speech.
+
+    Whisper often appends an outro to a chunk that also contains genuine
+    speech ("...обсудим бюджет. Продолжение следует..."). Dropping the whole
+    chunk loses the real content, so strip only the offending sentences.
+    """
+    if not text:
+        return ""
+
+    text = _ASTERISK_ANNOTATION_RE.sub(" ", text)
+    text = _BRACKET_ANNOTATION_RE.sub(
+        lambda m: " " if _looks_like_sound_event(m.group(1)) else m.group(0), text)
+
+    kept = []
+    for sentence in _SENTENCE_SPLIT_RE.split(text):
+        low = sentence.lower()
+        if any(p in low for p in _HALLUCINATION_PATTERNS):
+            continue
+        kept.append(sentence)
+
+    return re.sub(r"\s+", " ", " ".join(kept)).strip()
 
 MIN_SPEECH_RMS = 0.01  # below this = silence, skip transcription
 
@@ -382,6 +437,8 @@ def transcribe_chunk(model_unused, audio_np: np.ndarray) -> str:
     else:
         text = _transcribe_via_cli(audio_np, lang)
 
+    # Strip canned outros/sound events first — a chunk may hold real speech too
+    text = _strip_hallucinations(text)
     if _is_hallucination(text):
         return ""
     return text
@@ -393,6 +450,30 @@ _prev_chunks: list[str] = []
 _prev_speaker: str = ""
 _llm_model = None
 _llm_tokenizer = None
+_llm_sampler = None
+_llm_error_logged = False
+
+
+def _llm_generate(formatted_prompt: str, max_tokens: int = 150) -> str:
+    """Run the post-processing LLM.
+
+    mlx-lm dropped the `temp=` argument in favour of a sampler callable; passing
+    it raises TypeError deep inside generate_step. Build the sampler explicitly
+    and fall back to greedy decoding on older/newer builds.
+    """
+    global _llm_sampler
+    from mlx_lm import generate
+
+    if _llm_sampler is None:
+        try:
+            from mlx_lm.sample_utils import make_sampler
+            _llm_sampler = make_sampler(temp=0.1)
+        except Exception:
+            _llm_sampler = False  # sampler API unavailable — use defaults
+
+    kwargs = {"sampler": _llm_sampler} if _llm_sampler else {}
+    return generate(_llm_model, _llm_tokenizer, prompt=formatted_prompt,
+                    max_tokens=max_tokens, **kwargs)
 
 
 def _load_llm():
@@ -434,8 +515,8 @@ def _postprocess_text(text: str, timestamp: str) -> str:
 
     # Phase 2: LLM refinement (if available)
     if ENABLE_LLM_POST and _llm_model is not None and _prev_chunks:
+        global _llm_error_logged
         try:
-            from mlx_lm import generate
             context = "\n".join(_prev_chunks[-3:])
 
             # Build participant-aware prompt
@@ -465,12 +546,16 @@ New chunk:
 Corrected:"""
             messages = [{"role": "user", "content": prompt}]
             formatted = _llm_tokenizer.apply_chat_template(messages, add_generation_prompt=True, tokenize=False)
-            result = generate(_llm_model, _llm_tokenizer, prompt=formatted, max_tokens=150, temp=0.1)
-            result = result.strip()
+            result = _llm_generate(formatted).strip()
             if result and len(result) > 5 and not _is_hallucination(result):
                 clean_text = result
         except Exception as e:
-            pass  # fall back to rule-based
+            # Never fail the transcript over post-processing — but say so once,
+            # otherwise a broken LLM stage stays invisible for months.
+            if not _llm_error_logged:
+                _llm_error_logged = True
+                print(f"[meeting] LLM post-processing disabled after error: {e}",
+                      file=sys.stderr, flush=True)
 
     # Store for context
     _prev_chunks.append(f"{timestamp} {current_speaker} {clean_text}")
