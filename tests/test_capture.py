@@ -1063,7 +1063,8 @@ class TestLLMOutputGuard:
         assert capture_mod._llm_output_is_safe(original, "просто были элементы")[0]
 
     def test_rejects_dropped_number(self):
-        candidate = ("Давайте зафиксируем: бюджет, срок до пятницы, "
+        """Same length, so it is the figure rule that has to catch this."""
+        candidate = ("Давайте зафиксируем: бюджет сто тысяч, срок до пятницы, "
                      "ответственный Андрей.")
         ok, reason = capture_mod._llm_output_is_safe(self.ORIGINAL, candidate)
         assert not ok and reason == "dropped-number"

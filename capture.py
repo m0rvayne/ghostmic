@@ -43,6 +43,7 @@ PARTICIPANTS_BIN = Path(__file__).parent / ".build" / "zoom-participants"
 # tools/measure_llm_post.py and the note above _llm_output_is_safe.
 # Set LLM_POST=1 to opt in.
 ENABLE_LLM_POST = os.environ.get("LLM_POST", "0") == "1"
+LLM_MODEL = os.environ.get("LLM_MODEL", "mlx-community/Qwen3-0.6B-4bit")
 
 # Bounded queues
 audio_queue = queue.Queue(maxsize=MAX_QUEUE_CHUNKS)
@@ -847,8 +848,8 @@ def _load_llm():
         return True
     try:
         from mlx_lm import load
-        _llm_model, _llm_tokenizer = load("mlx-community/Qwen3-0.6B-4bit")
-        print("[meeting] LLM post-processor ready (Qwen3-0.6B)", flush=True)
+        _llm_model, _llm_tokenizer = load(LLM_MODEL)
+        print(f"[meeting] LLM post-processor ready ({LLM_MODEL})", flush=True)
         return True
     except Exception as e:
         print(f"[meeting] LLM not available: {e}. Using rule-based only.", file=sys.stderr, flush=True)
@@ -948,13 +949,14 @@ def _llm_output_is_safe(original: str, candidate: str) -> tuple[bool, str]:
     if _is_hallucination(candidate):
         return False, "hallucination"
 
+    # Figures first: it is the most specific thing that can go wrong, and the
+    # one nobody can sanity-check later from the text alone.
+    if any(d not in candidate for d in _DIGIT_RUN_RE.findall(original)):
+        return False, "dropped-number"
+
     ratio = len(candidate) / max(len(original), 1)
     if not (LLM_MIN_LENGTH_RATIO <= ratio <= LLM_MAX_LENGTH_RATIO):
         return False, "length"
-
-    # Figures are the one thing nobody can sanity-check later from the text.
-    if any(d not in candidate for d in _DIGIT_RUN_RE.findall(original)):
-        return False, "dropped-number"
 
     if _levenshtein(original, candidate) / max(len(original), 1) > LLM_MAX_DIVERGENCE:
         return False, "divergence"

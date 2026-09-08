@@ -69,6 +69,8 @@ def main():
     ap.add_argument("--show", type=int, default=6, help="worst cases to print")
     ap.add_argument("--show-accepted", type=int, default=8,
                     help="accepted-but-edited cases to print")
+    ap.add_argument("--model", default=None,
+                    help="mlx model id to measure (default: capture.LLM_MODEL)")
     args = ap.parse_args()
 
     if not args.dir.is_dir():
@@ -79,6 +81,9 @@ def main():
         sys.exit(f"No usable chunks found in {args.dir}")
     print(f"Loaded {len(samples)} chunks from {args.dir}\n")
 
+    if args.model:
+        capture.LLM_MODEL = args.model
+    print(f"model: {capture.LLM_MODEL}\n")
     if not capture._load_llm():
         sys.exit("Could not load the post-processing model.")
 
