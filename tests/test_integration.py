@@ -62,10 +62,14 @@ class TestMCPIntegration:
         async def check(session):
             tools = await session.list_tools()
             names = {t.name for t in tools.tools}
+            # Transcript access
             assert "get_live_transcript" in names
             assert "search_meetings" in names
             assert "ghostmic_status" in names
-            assert len(tools.tools) == 5
+            # Agent-native layer
+            assert {"meeting_context", "since_last_check", "decisions_so_far",
+                    "commitments", "ask_meeting"} <= names
+            assert len(tools.tools) == 10
         _sync_run(check)
 
     def test_ghostmic_status(self):
