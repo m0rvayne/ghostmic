@@ -1432,28 +1432,46 @@ class TestLanguageLock:
 
     def setup_method(self):
         capture_mod._detected_language = None
+        capture_mod._language_votes.clear()
         self._saved = capture_mod.LANGUAGE
         capture_mod.LANGUAGE = "auto"
 
     def teardown_method(self):
         capture_mod.LANGUAGE = self._saved
         capture_mod._detected_language = None
+        capture_mod._language_votes.clear()
+
+    def _vote(self, language, times=None):
+        for _ in range(times or capture_mod.LANGUAGE_LOCK_VOTES):
+            capture_mod._maybe_lock_language(self._solid(language))
 
     def _solid(self, language):
+        text = ("нормальная длинная реплика про бюджет"
+                if language in ("russian", "ukrainian")
+                else "a perfectly ordinary sentence about the budget")
         return capture_mod.Transcription(
-            "нормальная длинная реплика про бюджет",
-            [(f" w{i}", 0.95) for i in range(8)], language=language)
+            text, [(f" w{i}", 0.95) for i in range(8)], language=language)
 
     def test_auto_until_something_is_detected(self):
         assert capture_mod.effective_language() == "auto"
 
-    def test_locks_on_a_solid_chunk(self):
-        capture_mod._maybe_lock_language(self._solid("russian"))
+    def test_locks_after_enough_agreeing_chunks(self):
+        self._vote("russian")
         assert capture_mod.effective_language() == "ru"
 
-    def test_does_not_relock_once_set(self):
+    def test_one_chunk_is_not_enough(self):
+        self._vote("russian", times=1)
+        assert capture_mod.effective_language() == "auto"
+
+    def test_disagreement_does_not_lock(self):
         capture_mod._maybe_lock_language(self._solid("russian"))
         capture_mod._maybe_lock_language(self._solid("english"))
+        capture_mod._maybe_lock_language(self._solid("russian"))
+        assert capture_mod.effective_language() == "auto"
+
+    def test_does_not_relock_once_set(self):
+        self._vote("russian")
+        self._vote("english")
         assert capture_mod.effective_language() == "ru"
 
     def test_ignores_a_guessed_chunk(self):
@@ -1468,8 +1486,26 @@ class TestLanguageLock:
         assert capture_mod.effective_language() == "auto"
 
     def test_unknown_language_name_does_not_lock(self):
-        capture_mod._maybe_lock_language(self._solid("klingon"))
+        self._vote("klingon")
         assert capture_mod.effective_language() == "auto"
+
+    def test_english_claimed_over_cyrillic_is_not_believed(self):
+        """Observed for real: the glossary prompt is English product names and
+        whisper reported 'english' while transcribing correct Russian."""
+        russian_text = capture_mod.Transcription(
+            "мы обсудили бюджет и сроки по проекту",
+            [(f" w{i}", 0.95) for i in range(8)], language="english")
+        for _ in range(capture_mod.LANGUAGE_LOCK_VOTES):
+            capture_mod._maybe_lock_language(russian_text)
+        assert capture_mod.effective_language() == "auto"
+
+    def test_script_check_ignores_languages_it_cannot_judge(self):
+        japanese = capture_mod.Transcription(
+            "ご視聴ありがとうございました、また次回",
+            [(f" w{i}", 0.95) for i in range(8)], language="japanese")
+        for _ in range(capture_mod.LANGUAGE_LOCK_VOTES):
+            capture_mod._maybe_lock_language(japanese)
+        assert capture_mod.effective_language() == "ja"
 
     def test_no_confidence_never_locks(self):
         """The CLI path reports neither words nor language."""
@@ -1478,7 +1514,7 @@ class TestLanguageLock:
 
     def test_forced_language_is_never_overridden(self):
         capture_mod.LANGUAGE = "ru"
-        capture_mod._maybe_lock_language(self._solid("english"))
+        self._vote("english")
         assert capture_mod.effective_language() == "ru"
 
     def test_parser_reads_the_detected_language(self):

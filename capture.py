@@ -112,6 +112,41 @@ _LANGUAGE_CODES = {
 }
 
 
+# Detection is not to be taken at its word. The vocabulary prompt is mostly
+# English product names, and on a Russian line whisper came back with
+# "english" while transcribing perfectly good Russian. Two cross-checks:
+# the script actually written has to match the language claimed, and one
+# chunk is not enough to decide on.
+LANGUAGE_LOCK_VOTES = 3
+_CYRILLIC_LANGS = {"ru", "uk", "bg", "sr", "kk", "be", "mk"}
+_LATIN_LANGS = {"en", "de", "fr", "es", "it", "pt", "nl", "pl", "cs", "tr",
+                "sv", "no", "da", "fi", "ro", "hu"}
+_language_votes: list[str] = []
+
+
+def _dominant_script(text: str) -> str:
+    """Which alphabet the text is actually written in."""
+    cyrillic = latin = 0
+    for ch in text.lower():
+        if "а" <= ch <= "я" or ch == "ё":
+            cyrillic += 1
+        elif "a" <= ch <= "z":
+            latin += 1
+    if cyrillic == latin == 0:
+        return ""
+    return "cyrillic" if cyrillic > latin else "latin"
+
+
+def _script_contradicts(code: str, text: str) -> bool:
+    """True when the claimed language cannot be what is written here."""
+    expected = ("cyrillic" if code in _CYRILLIC_LANGS
+                else "latin" if code in _LATIN_LANGS else "")
+    if not expected:
+        return False  # scripts we do not reason about — do not block on it
+    script = _dominant_script(text)
+    return bool(script) and script != expected
+
+
 def effective_language() -> str:
     """The language code to ask whisper for on the next chunk."""
     if LANGUAGE != "auto":
@@ -129,6 +164,16 @@ def _maybe_lock_language(result: "Transcription"):
         return
     if len(result.words) < MIN_WORDS_TO_JUDGE or result.looks_like_noise:
         return  # too thin to draw a conclusion from
+    if _script_contradicts(code, result.text):
+        return  # "english" over Cyrillic text: believe the text
+
+    _language_votes.append(code)
+    del _language_votes[:-LANGUAGE_LOCK_VOTES]
+    if len(_language_votes) < LANGUAGE_LOCK_VOTES:
+        return
+    if len(set(_language_votes)) > 1:
+        return  # still changing its mind
+
     _detected_language = code
     print(f"[meeting] Language detected: {result.language} ({code}) — "
           f"locked for this meeting", flush=True)
