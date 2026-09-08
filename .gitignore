@@ -9,7 +9,19 @@ dist/
 build/
 .build/
 transcripts/
+
+# Runtime state, written next to the code when the daemon runs from a checkout.
+# config.json in particular holds the user's glossary — their product and
+# people names — and must never be committed.
+config.json
+build-info.json
 watcher.log
+watcher.pid
+watcher-status.json
+watcher-control.json
+agent-cursor.json
+whisper-server.log
+models/
 .DS_Store
 launch/
 ROADMAP*.md

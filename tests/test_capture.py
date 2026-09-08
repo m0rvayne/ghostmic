@@ -1083,15 +1083,16 @@ class TestLLMOutputGuard:
     def test_rejects_continuation_of_the_conversation(self):
         """Observed 14 times in 40 — output is fresh dialogue, not a repair."""
         ok, reason = capture_mod._llm_output_is_safe(
-            "Спасибо за субтитры Алексею Дубровскому!",
-            "Я не говорю, что это делать не надо. Просто у нас смещается фокус. "
-            "Мы долго говорили. Делаем первую версию, чтобы оно работало локально.")
+            "Короткая реплика в конце чанка.",
+            "Хорошо, тогда давайте вернёмся к этому на следующей неделе. "
+            "Я подготовлю смету и пришлю её вечером. Сроки пока не двигаем.")
         assert not ok and reason == "length"
 
     def test_rejects_rewrite_of_similar_length(self):
+        """Same length, entirely different sentence — a rewrite, not a repair."""
         ok, reason = capture_mod._llm_output_is_safe(
-            "Смотри, у тебя есть дочерние элементы, называются Info и Scope.",
-            "Твоей задачей будет до завтра привести остальные проекты в порядок.")
+            "Проверь, пожалуйста, вложенные разделы отчёта за квартал.",
+            "Завтра утром созвонимся и обсудим план на следующий спринт.")
         assert not ok and reason == "divergence"
 
     def test_rejects_empty_and_tiny(self):
