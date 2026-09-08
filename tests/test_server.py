@@ -539,3 +539,87 @@ class TestEmptySessionsHidden:
         with patch("server.MAX_PAST_MEETINGS", 2):
             assert len(server._meeting_files()) == 2
         assert len(server._meeting_files(limit=None)) == 6
+
+
+def _midnight_transcript() -> str:
+    """A call that runs from late evening into the next day."""
+    return "\n".join([
+        "[23:50:00-23:50:20]",
+        "[You] обсудили бюджет на квартал",
+        "",
+        "[23:58:00-23:58:20]",
+        "[Remote] хорошо, тогда договорились",
+        "",
+        "[00:03:00-00:03:20]",
+        "[You] и последнее по срокам",
+        "",
+        "[00:09:00-00:09:20]",
+        "[Remote] всё, расходимся",
+        "",
+    ])
+
+
+class TestMidnightRollover:
+    """Timecodes are wall clock, so a call past midnight runs 23:59 -> 00:00."""
+
+    def test_elapsed_unwraps_the_day_boundary(self):
+        entries = server._parse_entries(_midnight_transcript())
+        elapsed = server._elapsed_seconds(entries)
+        assert elapsed == sorted(elapsed), "time must not run backwards"
+        assert elapsed[-1] - elapsed[0] == 19 * 60  # 23:50 -> 00:09
+
+    def test_elapsed_on_a_normal_meeting(self):
+        entries = server._parse_entries(
+            "[10:00:00-10:00:20]\n[You] раз\n\n[10:05:00-10:05:20]\n[You] два\n")
+        assert server._elapsed_seconds(entries) == [36000, 36300]
+
+    def test_elapsed_on_no_entries(self):
+        assert server._elapsed_seconds([]) == []
+
+    def test_context_window_does_not_swallow_the_whole_call(self):
+        """Before the fix the cutoff went negative and matched everything."""
+        f = _transcripts / "night.txt"
+        f.write_text(_midnight_transcript(), encoding="utf-8")
+        with patch("server.TRANSCRIPTS_DIR", _transcripts):
+            result = _run(server.call_tool("meeting_context",
+                                           {"filename": "night.txt", "last_minutes": 10}))
+        text = result[0].text
+        assert "и последнее по срокам" in text      # inside the window
+        assert "обсудили бюджет" not in text        # 19 minutes back, outside it
+
+    def test_cursor_survives_the_day_boundary(self):
+        """A cursor holding 23:58 used to hide everything said after midnight."""
+        f = _transcripts / "night.txt"
+        f.write_text(_midnight_transcript(), encoding="utf-8")
+        with patch("server.TRANSCRIPTS_DIR", _transcripts), \
+             patch("server.CURSOR_FILE", _tmpdir / "cursor.json"):
+            first = _run(server.call_tool("since_last_check", {"filename": "night.txt"}))
+            assert "обсудили бюджет" in first[0].text
+
+            # nothing new yet
+            second = _run(server.call_tool("since_last_check", {"filename": "night.txt"}))
+            assert "Nothing new" in second[0].text
+
+            f.write_text(_midnight_transcript() +
+                         "\n[00:15:00-00:15:20]\n[You] совсем последнее\n",
+                         encoding="utf-8")
+            third = _run(server.call_tool("since_last_check", {"filename": "night.txt"}))
+            assert "совсем последнее" in third[0].text
+            assert "обсудили бюджет" not in third[0].text
+
+    def test_cursor_from_an_older_build_is_not_trusted(self):
+        """Old files hold a timecode string; re-send rather than skip."""
+        f = _transcripts / "night.txt"
+        f.write_text(_midnight_transcript(), encoding="utf-8")
+        cursor = _tmpdir / "cursor.json"
+        cursor.write_text('{"night.txt": "23:58:00"}', encoding="utf-8")
+        with patch("server.TRANSCRIPTS_DIR", _transcripts), \
+             patch("server.CURSOR_FILE", cursor):
+            result = _run(server.call_tool("since_last_check", {"filename": "night.txt"}))
+        assert "обсудили бюджет" in result[0].text
+
+    def test_live_transcript_window_unwraps_midnight(self):
+        text = _midnight_transcript()
+        filtered = server._filter_by_minutes(text, 10)
+        assert "и последнее по срокам" in filtered
+        assert "обсудили бюджет" not in filtered

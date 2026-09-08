@@ -52,6 +52,29 @@ fi
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
+# ── 0b. Integrity ────────────────────────────────────────────────────────────
+# What this catches: a truncated download, a corrupted mirror, a file swapped
+# after the fact. What it does NOT catch: a tampered repository, since an
+# attacker able to change capture.py can change checksums.txt in the same
+# commit. The real check is the commit hash printed below — compare it against
+# github.com/m0rvayne/ghostmic/commits/main if that matters to you.
+if [[ -f "$SCRIPT_DIR/checksums.txt" ]]; then
+    say "Verifying file integrity..."
+    if (cd "$SCRIPT_DIR" && shasum -a 256 -c checksums.txt >/dev/null 2>&1); then
+        ok "All files match checksums.txt"
+    else
+        err "Integrity check FAILED — a file does not match checksums.txt"
+        (cd "$SCRIPT_DIR" && shasum -a 256 -c checksums.txt 2>&1 | grep -v ': OK$' || true)
+        err "Refusing to install. Re-download, or run tools/gen-checksums.sh if you edited files locally."
+        exit 1
+    fi
+else
+    warn "No checksums.txt — skipping integrity check"
+fi
+
+INSTALLING_COMMIT="$(cd "$SCRIPT_DIR" && git rev-parse --short HEAD 2>/dev/null || echo unknown)"
+say "Installing commit: $INSTALLING_COMMIT"
+
 # ── 1. Homebrew ──────────────────────────────────────────────────────────────
 say "Checking Homebrew..."
 if command -v brew &>/dev/null; then
@@ -133,11 +156,10 @@ fi
 # ── 5b. Record what was installed ────────────────────────────────────────────
 # Without this there is no way to tell a running install from the repo it came
 # from — a deploy can sit months behind the source with nothing to show it.
-BUILD_COMMIT="$(cd "$SCRIPT_DIR" && git rev-parse --short HEAD 2>/dev/null || echo unknown)"
 cat > "$INSTALL_DIR/build-info.json" <<BUILDEOF
-{"commit": "$BUILD_COMMIT", "installed_at": "$(date -u +%Y-%m-%dT%H:%M:%SZ)"}
+{"commit": "$INSTALLING_COMMIT", "installed_at": "$(date -u +%Y-%m-%dT%H:%M:%SZ)"}
 BUILDEOF
-ok "Build recorded: $BUILD_COMMIT"
+ok "Build recorded: $INSTALLING_COMMIT"
 
 # ── 6. Python venv + deps ───────────────────────────────────────────────────
 say "Installing Python dependencies..."

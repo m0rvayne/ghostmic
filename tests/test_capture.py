@@ -1423,3 +1423,78 @@ class TestSubwordMerging:
     def test_first_token_without_a_space_still_starts_a_word(self):
         t = capture_mod.Transcription("x", [("Мы", 0.9), (" были", 0.9)])
         assert [w for w, _ in t.words] == ["Мы", "были"]
+
+
+class TestLanguageLock:
+    """Auto-detect per chunk guesses wrong on a quiet 20 seconds — which is
+    where English hallucinations in Russian meetings came from. Detect once on
+    a chunk worth trusting, then hold it."""
+
+    def setup_method(self):
+        capture_mod._detected_language = None
+        self._saved = capture_mod.LANGUAGE
+        capture_mod.LANGUAGE = "auto"
+
+    def teardown_method(self):
+        capture_mod.LANGUAGE = self._saved
+        capture_mod._detected_language = None
+
+    def _solid(self, language):
+        return capture_mod.Transcription(
+            "нормальная длинная реплика про бюджет",
+            [(f" w{i}", 0.95) for i in range(8)], language=language)
+
+    def test_auto_until_something_is_detected(self):
+        assert capture_mod.effective_language() == "auto"
+
+    def test_locks_on_a_solid_chunk(self):
+        capture_mod._maybe_lock_language(self._solid("russian"))
+        assert capture_mod.effective_language() == "ru"
+
+    def test_does_not_relock_once_set(self):
+        capture_mod._maybe_lock_language(self._solid("russian"))
+        capture_mod._maybe_lock_language(self._solid("english"))
+        assert capture_mod.effective_language() == "ru"
+
+    def test_ignores_a_guessed_chunk(self):
+        junk = capture_mod.Transcription(
+            "мусор", [(f" w{i}", 0.1) for i in range(8)], language="english")
+        capture_mod._maybe_lock_language(junk)
+        assert capture_mod.effective_language() == "auto"
+
+    def test_ignores_a_chunk_too_short_to_judge(self):
+        thin = capture_mod.Transcription("да", [(" да", 0.99)], language="english")
+        capture_mod._maybe_lock_language(thin)
+        assert capture_mod.effective_language() == "auto"
+
+    def test_unknown_language_name_does_not_lock(self):
+        capture_mod._maybe_lock_language(self._solid("klingon"))
+        assert capture_mod.effective_language() == "auto"
+
+    def test_no_confidence_never_locks(self):
+        """The CLI path reports neither words nor language."""
+        capture_mod._maybe_lock_language(capture_mod.Transcription("текст"))
+        assert capture_mod.effective_language() == "auto"
+
+    def test_forced_language_is_never_overridden(self):
+        capture_mod.LANGUAGE = "ru"
+        capture_mod._maybe_lock_language(self._solid("english"))
+        assert capture_mod.effective_language() == "ru"
+
+    def test_parser_reads_the_detected_language(self):
+        t = capture_mod._parse_verbose_json(
+            {"text": "x", "language": "russian", "segments": []})
+        assert t.language == "russian"
+
+
+class TestLanguageDefault:
+    def test_defaults_to_auto_not_russian(self):
+        """A hardcoded 'ru' would hand every English speaker Russian output."""
+        import importlib, os
+        saved = os.environ.pop("LANGUAGE", None)
+        try:
+            assert importlib.reload(capture_mod).LANGUAGE == "auto"
+        finally:
+            if saved is not None:
+                os.environ["LANGUAGE"] = saved
+            importlib.reload(capture_mod)

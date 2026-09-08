@@ -33,7 +33,7 @@ MAX_QUEUE_CHUNKS = 240  # ~4 min of audio in queue items
 _DEFAULT_TRANSCRIPT = Path(__file__).parent / "transcripts" / "meeting_transcript.txt"
 TRANSCRIPT_FILE = Path(os.environ.get("TRANSCRIPT_FILE", _DEFAULT_TRANSCRIPT))
 ENABLE_DIARIZATION = os.environ.get("DIARIZATION", "1") == "1"
-LANGUAGE = os.environ.get("LANGUAGE", "ru")  # forced language, "auto" for auto-detect
+LANGUAGE = os.environ.get("LANGUAGE", "auto")  # or a code like "ru" to force one
 CAPTURE_MODE = os.environ.get("CAPTURE_MODE", "coreaudio")  # "coreaudio" or "legacy"
 BUNDLE_ID = os.environ.get("BUNDLE_ID", "us.zoom.xos")
 
@@ -94,7 +94,44 @@ def get_remote_participants() -> list[str]:
     return all_p
 
 
-_detected_language = None
+# Whisper detects the language per request, and on a 20-second chunk of a quiet
+# moment it guesses wrong — which is where the English hallucinations in Russian
+# meetings came from. Detect once on a chunk worth trusting, then hold it for
+# the rest of the call. (This existed before the whisper.cpp migration and was
+# lost in it; _detected_language survived as an unused variable.)
+_detected_language: str | None = None
+
+_LANGUAGE_CODES = {
+    "russian": "ru", "english": "en", "ukrainian": "uk", "german": "de",
+    "french": "fr", "spanish": "es", "italian": "it", "portuguese": "pt",
+    "dutch": "nl", "polish": "pl", "czech": "cs", "turkish": "tr",
+    "arabic": "ar", "hebrew": "he", "hindi": "hi", "japanese": "ja",
+    "korean": "ko", "chinese": "zh", "swedish": "sv", "norwegian": "no",
+    "danish": "da", "finnish": "fi", "greek": "el", "romanian": "ro",
+    "hungarian": "hu", "kazakh": "kk", "serbian": "sr", "bulgarian": "bg",
+}
+
+
+def effective_language() -> str:
+    """The language code to ask whisper for on the next chunk."""
+    if LANGUAGE != "auto":
+        return LANGUAGE
+    return _detected_language or "auto"
+
+
+def _maybe_lock_language(result: "Transcription"):
+    """Pin the language once a chunk is solid enough to be believed."""
+    global _detected_language
+    if LANGUAGE != "auto" or _detected_language:
+        return
+    code = _LANGUAGE_CODES.get((result.language or "").strip().lower())
+    if not code:
+        return
+    if len(result.words) < MIN_WORDS_TO_JUDGE or result.looks_like_noise:
+        return  # too thin to draw a conclusion from
+    _detected_language = code
+    print(f"[meeting] Language detected: {result.language} ({code}) — "
+          f"locked for this meeting", flush=True)
 
 
 # -- Speaker diarization -------------------------------------------------------
@@ -549,6 +586,7 @@ class Transcription:
     """Text plus whatever the decoder was willing to say about its confidence."""
     text: str
     tokens: list[tuple[str, float]] = field(default_factory=list)
+    language: str = ""
 
     @property
     def has_confidence(self) -> bool:
@@ -606,7 +644,8 @@ def _parse_verbose_json(payload: dict) -> Transcription:
             prob = word.get("probability")
             if raw.strip() and isinstance(prob, (int, float)):
                 tokens.append((raw, float(prob)))
-    return Transcription(text=text, tokens=tokens)
+    return Transcription(text=text, tokens=tokens,
+                         language=str(payload.get("language") or ""))
 
 
 def _check_whisper_server() -> bool:
@@ -732,7 +771,7 @@ def transcribe_chunk(model_unused, audio_np: np.ndarray) -> str:
     if rms < gate:
         return ""
 
-    lang = LANGUAGE if LANGUAGE != "auto" else "auto"
+    lang = effective_language()
     prompt = build_whisper_prompt()
 
     # Try whisper-server first (model in memory, ~10x faster)
@@ -746,6 +785,8 @@ def transcribe_chunk(model_unused, audio_np: np.ndarray) -> str:
             result = _transcribe_via_cli(audio_np, lang, prompt)
     else:
         result = _transcribe_via_cli(audio_np, lang, prompt)
+
+    _maybe_lock_language(result)
 
     # A chunk the decoder mostly guessed at is noise wearing a sentence. Say so
     # rather than dropping it quietly — a silent discard is what hid the fixed

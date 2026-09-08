@@ -171,28 +171,37 @@ def _filter_by_minutes(text: str, last_minutes: float) -> str:
         return text
 
     ts_re = re.compile(r"^\[(\d{2}:\d{2}:\d{2})")
-    cutoff = None
 
-    for line in reversed(lines):
+    def _seconds(match) -> int:
+        h, m, sec = (int(x) for x in match.group(1).split(":"))
+        return h * 3600 + m * 60 + sec
+
+    # Unwrap midnight in one forward pass, so a call spanning it is not treated
+    # as running backwards.
+    stamped: list[tuple[int, int]] = []  # (line index, elapsed seconds)
+    offset = 0
+    previous = None
+    for i, line in enumerate(lines):
         m = ts_re.match(line)
-        if m:
-            p = m.group(1).split(":")
-            latest = int(p[0]) * 3600 + int(p[1]) * 60 + int(p[2])
-            cutoff = latest - last_minutes * 60
-            break
+        if not m:
+            continue
+        secs = _seconds(m)
+        if previous is not None and secs < previous:
+            offset += 86400
+        previous = secs
+        stamped.append((i, secs + offset))
 
-    if cutoff is None:
+    if not stamped:
         return "\n".join(lines[-max(1, int(last_minutes * 2)):])
 
+    cutoff = stamped[-1][1] - last_minutes * 60
+    keep_from = {i for i, t in stamped if t >= cutoff}
+
     result = []
-    for line in lines:
-        m = ts_re.match(line)
-        if m:
-            p = m.group(1).split(":")
-            secs = int(p[0]) * 3600 + int(p[1]) * 60 + int(p[2])
-            if secs >= cutoff:
-                result.append(line)
-        elif result:
+    for i, line in enumerate(lines):
+        if i in keep_from:
+            result.append(line)
+        elif result and not ts_re.match(line):
             result.append(line)
 
     return "\n".join(result) if result else "\n".join(lines[-3:])
@@ -282,6 +291,26 @@ def _parse_entries(text: str) -> list[Entry]:
             entries.append(Entry(start, end, speaker, body, continuation))
 
     return entries
+
+
+def _elapsed_seconds(entries: list[Entry]) -> list[int]:
+    """Seconds from the first entry, unwrapping midnight.
+
+    Timecodes are wall clock. A call that runs past midnight goes 23:59 -> 00:00,
+    and a plain comparison then places the end of the meeting before its start:
+    a ten-minute window would match the whole call, and a cursor holding "23:59"
+    would treat everything after midnight as already seen.
+    """
+    elapsed: list[int] = []
+    offset = 0
+    previous = None
+    for entry in entries:
+        seconds = entry.start_seconds
+        if previous is not None and seconds < previous:
+            offset += 86400
+        previous = seconds
+        elapsed.append(seconds + offset)
+    return elapsed
 
 
 def _participants(entries: list[Entry]) -> list[str]:
@@ -802,8 +831,9 @@ async def _handle_agent_tool(name: str, arguments: dict):
 
         recent = entries
         if entries and window > 0:
-            cutoff = entries[-1].start_seconds - window * 60
-            recent = [e for e in entries if e.start_seconds >= cutoff] or entries[-5:]
+            elapsed = _elapsed_seconds(entries)
+            cutoff = elapsed[-1] - window * 60
+            recent = [e for e, t in zip(entries, elapsed) if t >= cutoff] or entries[-5:]
 
         earlier = len(entries) - len(recent)
         body = "\n".join(e.render() for e in recent)
@@ -823,11 +853,16 @@ async def _handle_agent_tool(name: str, arguments: dict):
     if name == "since_last_check":
         cursor = _read_cursor()
         key = source
-        last_seen = cursor.get(key, "")
+        # Count entries rather than remember a timecode. The file only ever
+        # grows, so the count is monotonic — where a timecode is not, and a
+        # cursor holding "23:59" would swallow everything said after midnight.
+        seen = cursor.get(key, 0)
+        if not isinstance(seen, int) or seen < 0:
+            seen = 0  # a timecode from an older build: start over rather than skip
 
-        fresh = [e for e in entries if e.start > last_seen] if last_seen else entries
+        fresh = entries[seen:]
         if entries:
-            cursor[key] = entries[-1].start
+            cursor[key] = len(entries)
             _write_cursor(cursor)
 
         if not fresh:
@@ -839,7 +874,7 @@ async def _handle_agent_tool(name: str, arguments: dict):
         instruction = (
             f"{header}\n\n"
             f"{len(fresh)} new chunk(s) since you last checked"
-            f"{' (everything so far — first check)' if not last_seen else ''}. "
+            f"{' (everything so far — first check)' if not seen else ''}. "
             f"The cursor has been advanced, so the next call returns only what comes after this."
         )
         return [types.TextContent(type="text", text=_wrap_as_data(body, instruction))]

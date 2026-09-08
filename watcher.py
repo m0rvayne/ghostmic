@@ -292,7 +292,7 @@ def whisper_settings(config: WatcherConfig, user_cfg: dict) -> tuple[str, str]:
             or DEFAULT_WHISPER_MODEL)
     path = (os.environ.get("WHISPER_MODEL_PATH")
             or str(config.install_dir / "models" / f"ggml-{name}.bin"))
-    language = user_cfg.get("language", os.environ.get("LANGUAGE", "ru"))
+    language = user_cfg.get("language", os.environ.get("LANGUAGE", "auto"))
     return path, language
 
 
