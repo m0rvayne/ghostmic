@@ -20,6 +20,7 @@ import subprocess
 import time
 import threading
 from collections import deque
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 
@@ -530,6 +531,83 @@ def _audio_to_wav_bytes(audio_np: np.ndarray) -> bytes:
     return header + pcm
 
 
+# -- Transcription result ------------------------------------------------------
+#
+# whisper-server's verbose_json gives a probability for every word. We used to
+# ask for plain json and throw that away, which left no way to tell a confident
+# sentence from a guessed one — and no way to aim a correction pass at the part
+# that actually needs it.
+
+WORD_CONFIDENCE_FLOOR = 0.5   # below this the word is a guess
+CHUNK_JUNK_FRACTION = 0.6     # share of guessed words that makes a chunk noise
+MIN_WORDS_TO_JUDGE = 4        # too few words to draw any conclusion from
+
+
+@dataclass
+class Transcription:
+    """Text plus whatever the decoder was willing to say about its confidence."""
+    text: str
+    tokens: list[tuple[str, float]] = field(default_factory=list)
+
+    @property
+    def has_confidence(self) -> bool:
+        return bool(self.tokens)
+
+    @property
+    def words(self) -> list[tuple[str, float]]:
+        """Subword tokens merged into whole words.
+
+        whisper scores tokens, not words, and marks a word boundary with a
+        leading space: "Claude" arrives as " Cla" + "ude" with probabilities
+        0.35 and 1.00. Reporting "Cla" as the doubtful item is useless, so
+        pieces are joined and a word takes the confidence of its weakest
+        piece — if any part was guessed, the word is a guess.
+        """
+        merged: list[tuple[str, float]] = []
+        for raw, prob in self.tokens:
+            piece = raw.strip()
+            if not piece:
+                continue
+            if not merged or (raw[:1].isspace()):
+                merged.append((piece, prob))
+            else:
+                word, worst = merged[-1]
+                merged[-1] = (word + piece, min(worst, prob))
+        return merged
+
+    @property
+    def low_confidence_words(self) -> list[str]:
+        return [w for w, p in self.words if p < WORD_CONFIDENCE_FLOOR]
+
+    @property
+    def low_confidence_fraction(self) -> float:
+        words = self.words
+        if not words:
+            return 0.0
+        return len(self.low_confidence_words) / len(words)
+
+    @property
+    def looks_like_noise(self) -> bool:
+        """Mostly guessed words — the decoder was reading tea leaves."""
+        if len(self.words) < MIN_WORDS_TO_JUDGE:
+            return False
+        return self.low_confidence_fraction > CHUNK_JUNK_FRACTION
+
+
+def _parse_verbose_json(payload: dict) -> Transcription:
+    """Pull text and per-word probabilities out of a verbose_json reply."""
+    text = (payload.get("text") or "").strip()
+    tokens: list[tuple[str, float]] = []
+    for segment in payload.get("segments") or []:
+        for word in segment.get("words") or []:
+            # Keep the raw token: the leading space is the word boundary.
+            raw = word.get("word") or ""
+            prob = word.get("probability")
+            if raw.strip() and isinstance(prob, (int, float)):
+                tokens.append((raw, float(prob)))
+    return Transcription(text=text, tokens=tokens)
+
+
 def _check_whisper_server() -> bool:
     """Check if whisper-server is healthy."""
     global _whisper_server_available
@@ -547,7 +625,7 @@ def _check_whisper_server() -> bool:
     return False
 
 
-def _transcribe_via_server(wav_bytes: bytes, lang: str, prompt: str = "") -> str:
+def _transcribe_via_server(wav_bytes: bytes, lang: str, prompt: str = "") -> Transcription:
     """Transcribe via whisper-server HTTP API. Model stays in memory."""
     import urllib.request
     import json as _json
@@ -562,7 +640,7 @@ def _transcribe_via_server(wav_bytes: bytes, lang: str, prompt: str = "") -> str
                  f"Content-Disposition: form-data; name=\"file\"; filename=\"chunk.wav\"\r\n"
                  f"Content-Type: audio/wav\r\n\r\n")
     # Form fields
-    fields = {"response_format": "json", "temperature": "0.0", "beam_size": "1"}
+    fields = {"response_format": "verbose_json", "temperature": "0.0", "beam_size": "1"}
     if lang != "auto":
         fields["language"] = lang
     if prompt:
@@ -580,11 +658,10 @@ def _transcribe_via_server(wav_bytes: bytes, lang: str, prompt: str = "") -> str
     req.add_header("Content-Type", f"multipart/form-data; boundary={boundary}")
 
     with urllib.request.urlopen(req, timeout=30) as resp:
-        result = _json.loads(resp.read())
-        return result.get("text", "").strip()
+        return _parse_verbose_json(_json.loads(resp.read()))
 
 
-def _transcribe_via_cli(audio_np: np.ndarray, lang: str, prompt: str = "") -> str:
+def _transcribe_via_cli(audio_np: np.ndarray, lang: str, prompt: str = "") -> Transcription:
     """Transcribe via whisper-cli subprocess. Model loaded each time."""
     import tempfile
 
@@ -613,16 +690,32 @@ def _transcribe_via_cli(audio_np: np.ndarray, lang: str, prompt: str = "") -> st
         text = r.stdout.decode("utf-8", errors="replace").strip()
         text = text.replace("[BLANK_AUDIO]", "").strip()
         lines = [l.strip() for l in text.split("\n") if l.strip() and not l.strip().startswith("[")]
-        return " ".join(lines).strip()
+        # No per-word confidence on this path — the CLI does not report it.
+        return Transcription(text=" ".join(lines).strip())
 
     except Exception as e:
         print(f"[meeting] CLI transcription error: {e}", file=sys.stderr, flush=True)
-        return ""
+        return Transcription(text="")
     finally:
         try:
             os.unlink(tmp_wav)
         except OSError:
             pass
+
+
+# transcribe_chunk keeps returning a plain string — every caller and test
+# expects that — while the confidence data for the chunk it just produced is
+# parked here for the post-processing stage to aim with.
+_last_transcription = Transcription(text="")
+
+
+def _set_last_transcription(result: Transcription):
+    global _last_transcription
+    _last_transcription = result
+
+
+def last_transcription() -> Transcription:
+    return _last_transcription
 
 
 def transcribe_chunk(model_unused, audio_np: np.ndarray) -> str:
@@ -640,24 +733,35 @@ def transcribe_chunk(model_unused, audio_np: np.ndarray) -> str:
 
     lang = LANGUAGE if LANGUAGE != "auto" else "auto"
     prompt = build_whisper_prompt()
-    text = ""
 
     # Try whisper-server first (model in memory, ~10x faster)
     if _whisper_server_available:
         try:
             wav_bytes = _audio_to_wav_bytes(audio_np)
-            text = _transcribe_via_server(wav_bytes, lang, prompt)
+            result = _transcribe_via_server(wav_bytes, lang, prompt)
         except Exception as e:
             print(f"[meeting] Server transcription failed, falling back to CLI: {e}",
                   file=sys.stderr, flush=True)
-            text = _transcribe_via_cli(audio_np, lang, prompt)
+            result = _transcribe_via_cli(audio_np, lang, prompt)
     else:
-        text = _transcribe_via_cli(audio_np, lang, prompt)
+        result = _transcribe_via_cli(audio_np, lang, prompt)
+
+    # A chunk the decoder mostly guessed at is noise wearing a sentence. Say so
+    # rather than dropping it quietly — a silent discard is what hid the fixed
+    # RMS gate for months.
+    if result.looks_like_noise:
+        print(f"[meeting] (discarded: {result.low_confidence_fraction:.0%} of words "
+              f"below {WORD_CONFIDENCE_FLOOR} confidence) {result.text[:60]}", flush=True)
+        _set_last_transcription(Transcription(text=""))
+        return ""
 
     # Strip canned outros/sound events first — a chunk may hold real speech too
-    text = _strip_hallucinations(text)
+    text = _strip_hallucinations(result.text)
     if _is_hallucination(text):
+        _set_last_transcription(Transcription(text=""))
         return ""
+
+    _set_last_transcription(Transcription(text=text, tokens=result.tokens))
     return text
 
 

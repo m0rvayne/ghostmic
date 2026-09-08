@@ -1273,9 +1273,152 @@ class TestPromptReachesWhisper:
     def test_transcribe_chunk_builds_and_forwards_the_prompt(self):
         capture_mod._mix_noise.reset()
         seen = {}
+        def fake_cli(audio, lang, prompt):
+            seen["prompt"] = prompt
+            return capture_mod.Transcription(text="реальная реплика целиком")
+
         with patch.object(capture_mod, "build_whisper_prompt", return_value="P"), \
-             patch.object(capture_mod, "_transcribe_via_cli",
-                          side_effect=lambda a, l, p: seen.setdefault("prompt", p) or "text"):
+             patch.object(capture_mod, "_transcribe_via_cli", side_effect=fake_cli):
             capture_mod.transcribe_chunk(None, _speechlike(0.02))
         assert seen["prompt"] == "P"
         capture_mod._mix_noise.reset()
+
+
+# -- Tests for per-word confidence ---------------------------------------------
+
+def _verbose(words):
+    """A verbose_json payload shaped like whisper-server's."""
+    return {
+        "text": " ".join(w for w, _ in words),
+        "segments": [{
+            "id": 0,
+            "text": " ".join(w for w, _ in words),
+            "words": [{"word": " " + w, "probability": p} for w, p in words],
+        }],
+    }
+
+
+class TestParseVerboseJson:
+    """whisper-server reports a probability per word; we used to discard it."""
+
+    def test_extracts_text_and_words(self):
+        t = capture_mod._parse_verbose_json(_verbose([("бюджет", 0.99), ("250", 0.9)]))
+        assert t.text == "бюджет 250"
+        assert t.words == [("бюджет", 0.99), ("250", 0.9)]
+
+    def test_joins_multiple_segments(self):
+        payload = {"text": "а б", "segments": [
+            {"words": [{"word": " а", "probability": 0.9}]},
+            {"words": [{"word": " б", "probability": 0.8}]},
+        ]}
+        assert len(capture_mod._parse_verbose_json(payload).words) == 2
+
+    def test_survives_a_reply_with_no_words(self):
+        t = capture_mod._parse_verbose_json({"text": "привет"})
+        assert t.text == "привет" and not t.has_confidence
+
+    def test_skips_malformed_entries(self):
+        payload = {"text": "x", "segments": [{"words": [
+            {"word": " ок", "probability": 0.9},
+            {"word": "", "probability": 0.9},
+            {"word": " нет-вероятности"},
+            {"word": " плохая", "probability": None},
+        ]}]}
+        assert capture_mod._parse_verbose_json(payload).words == [("ок", 0.9)]
+
+    def test_empty_payload(self):
+        t = capture_mod._parse_verbose_json({})
+        assert t.text == "" and not t.has_confidence
+
+
+class TestTranscriptionConfidence:
+    def test_low_confidence_words_listed(self):
+        t = capture_mod.Transcription("x", [(" да", 0.99), (" мутное", 0.2)])
+        assert t.low_confidence_words == ["мутное"]
+
+    def test_fraction_computed(self):
+        t = capture_mod.Transcription("x", [(" а", 0.1), (" б", 0.1), (" в", 0.9), (" г", 0.9)])
+        assert t.low_confidence_fraction == 0.5
+
+    def test_confident_chunk_is_not_noise(self):
+        t = capture_mod.Transcription("x", [(f" w{i}", 0.95) for i in range(10)])
+        assert t.looks_like_noise is False
+
+    def test_mostly_guessed_chunk_is_noise(self):
+        t = capture_mod.Transcription("x", [(f" w{i}", 0.2) for i in range(10)])
+        assert t.looks_like_noise is True
+
+    def test_too_short_to_judge(self):
+        """Two guessed words is not evidence of anything."""
+        t = capture_mod.Transcription("x", [(" а", 0.1), (" б", 0.1)])
+        assert t.looks_like_noise is False
+
+    def test_no_confidence_means_no_verdict(self):
+        """The CLI path reports nothing, and must not be judged as noise."""
+        assert capture_mod.Transcription("длинная реплика").looks_like_noise is False
+
+
+class TestNoiseChunkDiscarded:
+    def setup_method(self):
+        capture_mod._mix_noise.reset()
+
+    def teardown_method(self):
+        capture_mod._mix_noise.reset()
+
+    def _run(self, result):
+        with patch.object(capture_mod, "_transcribe_via_cli", return_value=result), \
+             patch.object(capture_mod, "build_whisper_prompt", return_value=""):
+            return capture_mod.transcribe_chunk(None, _speechlike(0.02))
+
+    def test_guessed_chunk_returns_nothing(self):
+        junk = capture_mod.Transcription(
+            "какой-то правдоподобный мусор здесь",
+            [(f" w{i}", 0.15) for i in range(8)])
+        assert self._run(junk) == ""
+
+    def test_confident_chunk_survives(self):
+        good = capture_mod.Transcription(
+            "мы обсудили бюджет на квартал",
+            [(f" w{i}", 0.95) for i in range(8)])
+        assert self._run(good) == "мы обсудили бюджет на квартал"
+
+    def test_confidence_is_kept_for_the_correction_stage(self):
+        good = capture_mod.Transcription(
+            "мы обсудили бюджет на квартал",
+            [(" мы", 0.99), (" обсудили", 0.99), (" бюджет", 0.4),
+             (" на", 0.99), (" квартал", 0.99)])
+        self._run(good)
+        assert capture_mod.last_transcription().low_confidence_words == ["бюджет"]
+
+    def test_discarded_chunk_leaves_no_stale_confidence(self):
+        self._run(capture_mod.Transcription("ок", [(" ок", 0.99)]))
+        junk = capture_mod.Transcription("мусор", [(f" w{i}", 0.1) for i in range(8)])
+        self._run(junk)
+        assert capture_mod.last_transcription().tokens == []
+
+
+class TestSubwordMerging:
+    """whisper scores tokens, not words. 'Claude' arrives as ' Cla' + 'ude'."""
+
+    def test_pieces_join_into_one_word(self):
+        t = capture_mod.Transcription("Claude", [(" Cla", 0.35), ("ude", 1.0)])
+        assert [w for w, _ in t.words] == ["Claude"]
+
+    def test_word_takes_its_weakest_piece(self):
+        t = capture_mod.Transcription("Claude", [(" Cla", 0.35), ("ude", 1.0)])
+        assert t.words[0][1] == 0.35
+
+    def test_the_whole_word_is_reported_not_the_fragment(self):
+        """Observed for real: the doubtful item used to come back as 'Cla'."""
+        t = capture_mod.Transcription("x", [(" Cla", 0.35), ("ude", 1.0),
+                                            (" Code", 0.98)])
+        assert t.low_confidence_words == ["Claude"]
+
+    def test_hyphenated_word_stays_one_word(self):
+        t = capture_mod.Transcription("x", [(" М", 0.52), ("айн", 0.75),
+                                            ("д", 0.99), ("-", 0.57), ("карту", 0.9)])
+        assert [w for w, _ in t.words] == ["Майнд-карту"]
+
+    def test_first_token_without_a_space_still_starts_a_word(self):
+        t = capture_mod.Transcription("x", [("Мы", 0.9), (" были", 0.9)])
+        assert [w for w, _ in t.words] == ["Мы", "были"]
