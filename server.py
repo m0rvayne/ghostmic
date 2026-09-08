@@ -45,6 +45,47 @@ MAX_TRANSCRIPT_BYTES = 50 * 1024 * 1024
 MAX_PAST_MEETINGS = 200
 MAX_SEARCH_RESULTS = 20
 
+# Sessions where nobody spoke leave a file holding only the "Meeting started"
+# banner. The watcher now discards them at stop, but 1136 of them predate that
+# and would otherwise fill the newest-200 window and hide real meetings.
+#
+# Size cannot decide this: the banner is ~157 bytes and a one-line meeting is
+# barely over 200, so any byte threshold either keeps junk or drops real short
+# calls. Look for a timecode instead — it sits immediately after the banner.
+_ENTRY_LINE_RE = re.compile(r"^\[\d{2}:\d{2}:\d{2}-\d{2}:\d{2}:\d{2}\]", re.M)
+CONTENT_PROBE_BYTES = 4096
+
+
+def _has_transcript_content(path: Path) -> bool:
+    """True if the file holds at least one transcribed line."""
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            return bool(_ENTRY_LINE_RE.search(f.read(CONTENT_PROBE_BYTES)))
+    except OSError:
+        return False
+
+
+_LIMIT_DEFAULT = object()
+
+
+def _meeting_files(limit=_LIMIT_DEFAULT) -> list[Path]:
+    """Saved meetings, newest first — no live symlink, no empty sessions."""
+    if limit is _LIMIT_DEFAULT:
+        limit = MAX_PAST_MEETINGS  # read at call time so it stays patchable
+    tdir = _get_transcripts_dir()
+    if not tdir.exists():
+        return []
+    kept: list[Path] = []
+    for f in sorted(tdir.glob("*.txt"), reverse=True):
+        if f.name == "meeting_transcript.txt" or f.is_symlink():
+            continue
+        if not _has_transcript_content(f):
+            continue
+        kept.append(f)
+        if limit is not None and len(kept) >= limit:
+            break
+    return kept
+
 server = Server("ghostmic")
 
 
@@ -371,20 +412,12 @@ async def list_resources():
             description="Current or most recent meeting transcript (updates every ~30s during recording)",
             mimeType="text/plain",
         ))
-    tdir = _get_transcripts_dir()
-    if tdir.exists():
-        count = 0
-        for f in sorted(tdir.glob("*.txt"), reverse=True):
-            if f.name == "meeting_transcript.txt" or f.is_symlink():
-                continue
-            resources.append(types.Resource(
-                uri=f"ghostmic://meetings/{f.name}",
-                name=f"Meeting {f.stem}",
-                mimeType="text/plain",
-            ))
-            count += 1
-            if count >= MAX_PAST_MEETINGS:
-                break
+    for f in _meeting_files():
+        resources.append(types.Resource(
+            uri=f"ghostmic://meetings/{f.name}",
+            name=f"Meeting {f.stem}",
+            mimeType="text/plain",
+        ))
     return resources
 
 
@@ -921,14 +954,9 @@ async def call_tool(name: str, arguments: dict | None):
         return [types.TextContent(type="text", text=result)]
 
     elif name == "list_meetings":
-        tdir = _get_transcripts_dir()
-        if not tdir.exists():
-            return [types.TextContent(type="text", text="No meetings recorded yet.")]
-        files = sorted(tdir.glob("*.txt"), reverse=True)
-        files = [f for f in files if f.name != "meeting_transcript.txt" and not f.is_symlink()]
+        files = _meeting_files()
         if not files:
             return [types.TextContent(type="text", text="No meetings recorded yet.")]
-        files = files[:MAX_PAST_MEETINGS]
         lines = [f"- {f.name}  ({f.stat().st_size // 1024} KB)" for f in files]
         return [types.TextContent(type="text", text="\n".join(lines))]
 
@@ -945,15 +973,12 @@ async def call_tool(name: str, arguments: dict | None):
         query = arguments.get("query", "").strip()
         if not query:
             return [types.TextContent(type="text", text="Please provide a search query.")]
-        tdir = _get_transcripts_dir()
-        if not tdir.exists():
+        files = _meeting_files()
+        if not files:
             return [types.TextContent(type="text", text="No transcripts to search.")]
 
         results = []
-        files = sorted(tdir.glob("*.txt"), reverse=True)
-        files = [f for f in files if f.name != "meeting_transcript.txt" and not f.is_symlink()]
-
-        for f in files[:MAX_PAST_MEETINGS]:
+        for f in files:
             if f.stat().st_size > MAX_TRANSCRIPT_BYTES:
                 continue
             try:
@@ -1002,8 +1027,7 @@ async def call_tool(name: str, arguments: dict | None):
 
         tdir = _get_transcripts_dir()
         if tdir.exists():
-            txt_files = [f for f in tdir.glob("*.txt")
-                         if f.name != "meeting_transcript.txt" and not f.is_symlink()]
+            txt_files = _meeting_files(limit=None)
             total_size = sum(f.stat().st_size for f in txt_files)
             parts.append(f"Saved meetings: {len(txt_files)} ({total_size // 1024 // 1024} MB)")
         else:

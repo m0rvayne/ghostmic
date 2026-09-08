@@ -474,3 +474,62 @@ class TestWhisperServerLifecycle:
         ctx.whisper_server_process = mock_proc
         watcher.stop_whisper_server(ctx)
         mock_proc.terminate.assert_called_once()
+
+
+BANNER = ("\n" + "=" * 60 + "\nMeeting started: 2026-09-07 10:03\n" + "=" * 60 + "\n")
+
+
+class TestDiscardEmptyTranscripts:
+    """A session where nobody spoke should not leave a file behind.
+
+    1136 of the 1324 files in the archive were banner-only, and because
+    list_meetings walks the newest 200 they were hiding real meetings.
+    """
+
+    def test_banner_only_file_is_removed(self, tmp_path):
+        f = tmp_path / "2026-09-07_10-03-08.txt"
+        f.write_text(BANNER, encoding="utf-8")
+        assert watcher.discard_if_empty(f) is True
+        assert not f.exists()
+
+    def test_file_with_one_line_is_kept(self, tmp_path):
+        """A short real meeting is barely over 200 bytes — size cannot decide."""
+        f = tmp_path / "short.txt"
+        f.write_text(BANNER + "[10:05:10-10:05:30]\n[You] да\n\n", encoding="utf-8")
+        assert watcher.discard_if_empty(f) is False
+        assert f.exists()
+
+    def test_large_file_is_never_read(self, tmp_path):
+        f = tmp_path / "big.txt"
+        f.write_text("x" * (watcher.MAX_EMPTY_CHECK_BYTES + 1), encoding="utf-8")
+        assert watcher.discard_if_empty(f) is False
+        assert f.exists()
+
+    def test_missing_file_and_none(self, tmp_path):
+        assert watcher.discard_if_empty(tmp_path / "gone.txt") is False
+        assert watcher.discard_if_empty(None) is False
+
+    def test_undecodable_bytes_do_not_raise(self, tmp_path):
+        """Junk bytes hold no transcribed line either, so they go the same way.
+
+        Safe because the path is always the file this watcher just created for
+        the session it is ending — nothing else writes there.
+        """
+        f = tmp_path / "junk.txt"
+        f.write_bytes(b"\xff\xfe not utf-8 at all")
+        assert watcher.discard_if_empty(f) is True
+        assert not f.exists()
+
+    def test_stop_capture_discards_and_says_so(self, tmp_path, caplog):
+        cfg = watcher.default_config()
+        ctx = watcher.WatcherContext(config=cfg)
+        transcript = tmp_path / "empty.txt"
+        transcript.write_text(BANNER, encoding="utf-8")
+        ctx.current_transcript = transcript
+        ctx.capture_process = None
+
+        with patch.object(watcher, "write_status"):
+            watcher.stop_capture(ctx)
+
+        assert not transcript.exists()
+        assert ctx.state == watcher.State.IDLE

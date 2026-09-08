@@ -11,6 +11,7 @@ import fcntl
 import json
 import logging
 import os
+import re
 import sys
 import time
 import signal
@@ -125,12 +126,16 @@ def setup_logging(config: WatcherConfig):
     ))
     logger.addHandler(fh)
 
-    sh = logging.StreamHandler()
-    sh.setFormatter(logging.Formatter(
-        "[watcher %(asctime)s] %(message)s",
-        datefmt="%H:%M:%S",
-    ))
-    logger.addHandler(sh)
+    # Under the LaunchAgent, stdout is redirected into this same file, so a
+    # console handler would write every line twice — that is how watcher.log.1
+    # and .2 reached 10 and 12 MB. Attach it only for an interactive run.
+    if sys.stdout.isatty():
+        sh = logging.StreamHandler()
+        sh.setFormatter(logging.Formatter(
+            "[watcher %(asctime)s] %(message)s",
+            datefmt="%H:%M:%S",
+        ))
+        logger.addHandler(sh)
 
 
 # --------------------------------------------------------------------------
@@ -414,6 +419,31 @@ def start_capture(ctx: WatcherContext):
     logger.info(f"Recording started -> {ctx.current_transcript.name}")
 
 
+# A session that produced no speech leaves a file holding nothing but the
+# "Meeting started" banner. 1136 of the 1324 files in the archive were exactly
+# that, and because list_meetings and search_meetings walk the newest 200
+# files, the junk was crowding real meetings out of view.
+_ENTRY_LINE_RE = re.compile(r"^\[\d{2}:\d{2}:\d{2}-\d{2}:\d{2}:\d{2}\]", re.M)
+MAX_EMPTY_CHECK_BYTES = 64 * 1024
+
+
+def discard_if_empty(path: Optional[Path]) -> bool:
+    """Delete a transcript that never got a single line. True if removed."""
+    if path is None:
+        return False
+    try:
+        if not path.exists():
+            return False
+        if path.stat().st_size > MAX_EMPTY_CHECK_BYTES:
+            return False  # plainly has content; do not read it to find out
+        if _ENTRY_LINE_RE.search(path.read_text(encoding="utf-8", errors="replace")):
+            return False
+        path.unlink()
+        return True
+    except OSError:
+        return False
+
+
 def stop_capture(ctx: WatcherContext):
     if ctx.capture_process and ctx.capture_process.poll() is None:
         ctx.capture_process.send_signal(signal.SIGTERM)
@@ -426,11 +456,15 @@ def stop_capture(ctx: WatcherContext):
         ctx.crash_times.append(time.monotonic())
 
     saved_name = ctx.current_transcript.name if ctx.current_transcript else "unknown"
+    discarded = discard_if_empty(ctx.current_transcript)
     ctx.capture_process = None
     ctx.current_transcript = None
     write_status(ctx.config, "IDLE")
     ctx.state = State.IDLE
-    logger.info(f"Recording stopped. Transcript: {saved_name}")
+    if discarded:
+        logger.info(f"Recording stopped. Nothing was said — discarded {saved_name}")
+    else:
+        logger.info(f"Recording stopped. Transcript: {saved_name}")
 
 
 def notify(title: str, message: str):

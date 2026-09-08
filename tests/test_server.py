@@ -239,7 +239,7 @@ class TestListPastMeetings:
 
     def test_respects_max_limit(self):
         for i in range(10):
-            (_transcripts / f"meeting_{i:03d}.txt").write_text(f"content {i}")
+            (_transcripts / f"meeting_{i:03d}.txt").write_text(f"[14:00:00-14:00:30] content {i}\n")
         with patch("server.TRANSCRIPTS_DIR", _transcripts), \
              patch("server.MAX_PAST_MEETINGS", 3):
             result = _run(server.call_tool("list_meetings", {}))
@@ -288,7 +288,7 @@ class TestGetStatus:
 
     def test_shows_transcript_count(self):
         for i in range(5):
-            (_transcripts / f"meeting_{i}.txt").write_text(f"content {i}")
+            (_transcripts / f"meeting_{i}.txt").write_text(f"[14:00:00-14:00:30] content {i}\n")
         with patch("server.TRANSCRIPTS_DIR", _transcripts), \
              patch("server.PID_FILE", _tmpdir / "nonexistent.pid"), \
              patch("server.INSTALL_DIR", _tmpdir):
@@ -419,7 +419,7 @@ class TestSecurityEdgeCases:
     def test_search_query_with_regex_metacharacters(self):
         """Regex metacharacters in search should not cause errors.
         search_meetings uses str.lower() in, not re, so this should be safe."""
-        (_transcripts / "meeting.txt").write_text("The cost is $100 (maybe more).\n")
+        (_transcripts / "meeting.txt").write_text("[14:00:00-14:00:30] The cost is $100 (maybe more).\n")
         with patch("server.TRANSCRIPTS_DIR", _transcripts):
             result = _run(server.call_tool("search_meetings", {"query": "$100 (maybe"}))
         # Should find the match via substring, not crash with regex error
@@ -482,3 +482,60 @@ class TestPromptSecurity:
         # The raw </transcript> from the malicious content must still be present
         # (it is data, not a structural tag)
         assert "</transcript>" in text
+
+
+BANNER = ("\n" + "=" * 60 + "\nMeeting started: 2026-09-07 10:03\n" + "=" * 60 + "\n")
+
+
+class TestEmptySessionsHidden:
+    """Banner-only files must not occupy the newest-200 window."""
+
+    def test_has_content_detects_a_timecode(self):
+        f = _transcripts / "real.txt"
+        f.write_text(BANNER + "[10:05:10-10:05:30]\n[You] да\n", encoding="utf-8")
+        assert server._has_transcript_content(f) is True
+
+    def test_has_content_rejects_banner_only(self):
+        f = _transcripts / "empty.txt"
+        f.write_text(BANNER, encoding="utf-8")
+        assert server._has_transcript_content(f) is False
+
+    def test_has_content_on_missing_file(self):
+        assert server._has_transcript_content(_transcripts / "nope.txt") is False
+
+    def test_list_meetings_hides_empty_sessions(self):
+        (_transcripts / "2026-09-01_empty.txt").write_text(BANNER, encoding="utf-8")
+        (_transcripts / "2026-09-02_real.txt").write_text(
+            BANNER + "[10:05:10-10:05:30] реальная реплика\n", encoding="utf-8")
+        with patch("server.TRANSCRIPTS_DIR", _transcripts):
+            result = _run(server.call_tool("list_meetings", {}))
+        assert "2026-09-02_real.txt" in result[0].text
+        assert "2026-09-01_empty.txt" not in result[0].text
+
+    def test_empty_sessions_do_not_crowd_out_real_ones(self):
+        """The archive shape: a wall of junk newer than the real meeting."""
+        for i in range(30):
+            (_transcripts / f"2026-09-{i:02d}_junk.txt").write_text(BANNER, encoding="utf-8")
+        (_transcripts / "2026-08-01_real.txt").write_text(
+            BANNER + "[10:05:10-10:05:30] бюджет обсудили\n", encoding="utf-8")
+        with patch("server.TRANSCRIPTS_DIR", _transcripts), \
+             patch("server.MAX_PAST_MEETINGS", 5):
+            result = _run(server.call_tool("list_meetings", {}))
+        assert "2026-08-01_real.txt" in result[0].text
+
+    def test_search_skips_empty_sessions(self):
+        (_transcripts / "empty.txt").write_text(BANNER, encoding="utf-8")
+        (_transcripts / "real.txt").write_text(
+            BANNER + "[10:05:10-10:05:30] обсудили бюджет\n", encoding="utf-8")
+        with patch("server.TRANSCRIPTS_DIR", _transcripts):
+            result = _run(server.call_tool("search_meetings", {"query": "бюджет"}))
+        assert "real.txt" in result[0].text
+        assert "empty.txt" not in result[0].text
+
+    def test_meeting_files_limit_is_read_at_call_time(self):
+        for i in range(6):
+            (_transcripts / f"m{i}.txt").write_text(
+                BANNER + f"[10:0{i}:00-10:0{i}:30] строка {i}\n", encoding="utf-8")
+        with patch("server.MAX_PAST_MEETINGS", 2):
+            assert len(server._meeting_files()) == 2
+        assert len(server._meeting_files(limit=None)) == 6
