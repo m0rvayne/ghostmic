@@ -775,6 +775,15 @@ _llm_sampler = None
 _llm_error_logged = False
 
 
+def _llm_budget(text: str) -> int:
+    """Room to echo the chunk back plus a little slack for repairs."""
+    try:
+        n = len(_llm_tokenizer.encode(text))
+    except Exception:
+        n = len(text) // 2
+    return max(64, min(1024, int(n * 1.4) + 48))
+
+
 def _llm_generate(formatted_prompt: str, max_tokens: int = 150) -> str:
     """Run the post-processing LLM.
 
@@ -798,6 +807,7 @@ def _llm_generate(formatted_prompt: str, max_tokens: int = 150) -> str:
 
 
 _THINK_BLOCK_RE = re.compile(r"<think>.*?</think>", re.DOTALL)
+_FENCE_RE = re.compile(r"</?(?:chunk|context)>")
 
 
 def _strip_think_block(text: str) -> str:
@@ -807,12 +817,16 @@ def _strip_think_block(text: str) -> str:
     decides, and when it opens a <think> block the tags land in the output and
     from there would land in the transcript.
     """
-    return _THINK_BLOCK_RE.sub(" ", text).replace("<think>", " ").replace("</think>", " ").strip()
+    text = _THINK_BLOCK_RE.sub(" ", text).replace("<think>", " ").replace("</think>", " ")
+    # The chunk is fenced in the prompt and the model sometimes echoes the
+    # fence back around its answer.
+    return _FENCE_RE.sub(" ", text).strip()
 
 
-def _llm_refine(clean_text: str, context: str, participants: list[str]) -> str:
+def _llm_refine(clean_text: str, context: str, participants: list[str],
+                doubtful: list[str] | None = None) -> str:
     """Run one post-processing pass. Returns the model's cleaned-up output."""
-    prompt = _build_llm_prompt(clean_text, context, participants)
+    prompt = _build_llm_prompt(clean_text, context, participants, doubtful)
     messages = [{"role": "user", "content": prompt}]
     try:
         formatted = _llm_tokenizer.apply_chat_template(
@@ -822,7 +836,8 @@ def _llm_refine(clean_text: str, context: str, participants: list[str]) -> str:
         # Older templates have no such switch — _strip_think_block covers it.
         formatted = _llm_tokenizer.apply_chat_template(
             messages, add_generation_prompt=True, tokenize=False)
-    return _strip_think_block(_llm_generate(formatted).strip())
+    return _strip_think_block(
+        _llm_generate(formatted, max_tokens=_llm_budget(clean_text)).strip())
 
 
 def _load_llm():
@@ -840,31 +855,46 @@ def _load_llm():
         return False
 
 
-def _build_llm_prompt(clean_text: str, context: str, participants: list[str]) -> str:
-    """The instruction handed to the post-processing model."""
-    participant_hint = ""
-    if participants:
-        names = ", ".join(participants)
-        participant_hint = f"""- Meeting participants: {names}
-- If you can identify who is speaking from context, prefix with [Name]
-- If multiple speakers in one chunk, split with newlines: [Name1] text\\n[Name2] text
-"""
+def _build_llm_prompt(clean_text: str, context: str, participants: list[str],
+                      doubtful: list[str] | None = None) -> str:
+    """The instruction handed to the post-processing model.
 
-    return f"""Fix this speech-to-text transcript chunk using the context. Rules:
-- Fix obvious recognition errors based on context
-- If chunk starts mid-sentence (continuing previous), merge naturally
-- Keep it concise, output ONLY the corrected text
-- Keep the same language as input
-- Do NOT add anything not in the original
-{participant_hint}
-Context:
+    Order matters here. The first version led with the rules and then put
+    "Context:" immediately before "New chunk:", which reads to a small instruct
+    model as an invitation to carry on writing the conversation — and that is
+    what it did in 35% of measured chunks. The context is now fenced and
+    labelled as reference, and the rules sit last, right before the generation
+    point, where recency gives them the most weight.
+    """
+    people = ", ".join(participants) if participants else ""
+    doubtful_block = ""
+    if doubtful:
+        doubtful_block = (
+            "\nThe speech recogniser was unsure of these words:\n"
+            f"{', '.join(doubtful)}\n")
+
+    return f"""You are repairing one chunk of an automatic speech-to-text transcript.
+
+Earlier chunks, for reference only. Do NOT continue them, do NOT copy from them:
+<context>
 {context}
+</context>
 
-New chunk:
+The chunk to repair:
+<chunk>
 {clean_text}
+</chunk>
+{doubtful_block}{f"People in this meeting: {people}" if people else ""}
+Rules:
+- Output the chunk again, repairing only what is clearly a recognition error.
+- Copy every other word exactly as it appears.
+- Do not continue the conversation. Do not add or remove sentences.
+- Do not change numbers or names.
+- Keep the original language.
+- If nothing can be repaired with confidence, output the chunk unchanged.
 
 /no_think
-Corrected:"""
+The repaired chunk:"""
 
 
 # The post-processor is a 0.6B model at 4-bit being asked to edit Russian
@@ -884,8 +914,12 @@ Corrected:"""
 # the burden is on its output to still look like its input.
 
 LLM_MAX_DIVERGENCE = 0.35     # normalised edit distance
-LLM_MIN_LENGTH_RATIO = 0.5
-LLM_MAX_LENGTH_RATIO = 1.8
+# Repairing a misheard word barely moves the length. Dropping the tail of the
+# chunk halves it — and that, not fabrication, is what the model does most
+# often once the prompt stops inviting it to continue the conversation. The
+# old floor of 0.5 waved every one of those through.
+LLM_MIN_LENGTH_RATIO = 0.92
+LLM_MAX_LENGTH_RATIO = 1.15
 
 _DIGIT_RUN_RE = re.compile(r"\d+")
 _llm_rejections: dict[str, int] = {}
@@ -963,12 +997,19 @@ def _postprocess_text(text: str, timestamp: str) -> str:
         global _llm_error_logged
         try:
             context = "\n".join(_prev_chunks[-3:])
-            result = _llm_refine(clean_text, context, get_remote_participants())
-            accepted, reason = _llm_output_is_safe(clean_text, result)
-            if accepted:
-                clean_text = result
-            else:
-                _note_llm_rejection(reason)
+            doubtful = last_transcription().low_confidence_words
+
+            # Nothing the decoder was unsure about means nothing to repair.
+            # Calling the model anyway is how confident text got truncated:
+            # asked to improve a correct sentence, it removes the last one.
+            if doubtful:
+                result = _llm_refine(clean_text, context,
+                                     get_remote_participants(), doubtful)
+                accepted, reason = _llm_output_is_safe(clean_text, result)
+                if accepted:
+                    clean_text = result
+                else:
+                    _note_llm_rejection(reason)
         except Exception as e:
             # Never fail the transcript over post-processing — but say so once,
             # otherwise a broken LLM stage stays invisible for months.
