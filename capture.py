@@ -263,6 +263,71 @@ WHISPER_SERVER_PORT = int(os.environ.get("WHISPER_SERVER_PORT", "8178"))
 _whisper_server_available = False  # set True after successful health check
 
 
+# -- Vocabulary biasing --------------------------------------------------------
+#
+# whisper.cpp takes an initial prompt that biases decoding toward preferred
+# spellings, and this is where names and domain terms belong. Fixing them here
+# is deterministic and free; fixing them afterwards means asking a model to
+# rewrite text it has no way to verify, which is what the Qwen3 stage was for
+# and why it kept inventing.
+#
+# Measured on a synthesised line: without a prompt whisper returns
+# "Клод Кот ... в Ресерчере"; with one it returns "Claude Code ... в Researcher".
+#
+# Only the last 224 tokens of the prompt are consumed and later tokens weigh
+# more, so the list is trimmed from the front and the most specific terms —
+# the people actually on this call — go last.
+
+CONFIG_FILE = Path(__file__).parent / "config.json"
+WHISPER_PROMPT_MAX_CHARS = 600  # ~224 tokens of mixed RU/EN, conservatively
+_PROMPT_PREFIX = "Совещание. Участники и термины: "
+
+
+def _load_glossary() -> list[str]:
+    """Terms the user wants spelled a particular way, from config.json."""
+    try:
+        import json as _json
+        data = _json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
+        terms = data.get("glossary", [])
+        if isinstance(terms, str):
+            terms = terms.split(",")
+        return [str(t).strip() for t in terms if str(t).strip()]
+    except Exception:
+        return []
+
+
+def _render_prompt(terms: list[str]) -> str:
+    return f"{_PROMPT_PREFIX}{', '.join(terms)}."
+
+
+def build_whisper_prompt(participants: list[str] | None = None,
+                         glossary: list[str] | None = None,
+                         max_chars: int = WHISPER_PROMPT_MAX_CHARS) -> str:
+    """Initial prompt biasing decoding toward known names and terms."""
+    if participants is None:
+        participants = get_remote_participants()
+    if glossary is None:
+        glossary = _load_glossary()
+
+    terms: list[str] = []
+    seen: set[str] = set()
+    for term in list(glossary) + list(participants):  # participants last = strongest
+        cleaned = str(term).strip()
+        key = cleaned.casefold()
+        if not cleaned or key in seen:
+            continue
+        seen.add(key)
+        terms.append(cleaned)
+
+    if not terms:
+        return ""
+
+    # Drop from the front until it fits: the tail is the part that carries.
+    while len(terms) > 1 and len(_render_prompt(terms)) > max_chars:
+        terms.pop(0)
+    return _render_prompt(terms)[:max_chars]
+
+
 def format_time(dt: datetime) -> str:
     return dt.strftime("%H:%M:%S")
 
@@ -482,7 +547,7 @@ def _check_whisper_server() -> bool:
     return False
 
 
-def _transcribe_via_server(wav_bytes: bytes, lang: str) -> str:
+def _transcribe_via_server(wav_bytes: bytes, lang: str, prompt: str = "") -> str:
     """Transcribe via whisper-server HTTP API. Model stays in memory."""
     import urllib.request
     import json as _json
@@ -500,6 +565,8 @@ def _transcribe_via_server(wav_bytes: bytes, lang: str) -> str:
     fields = {"response_format": "json", "temperature": "0.0", "beam_size": "1"}
     if lang != "auto":
         fields["language"] = lang
+    if prompt:
+        fields["prompt"] = prompt
 
     body = b""
     body += parts[0].encode()
@@ -517,7 +584,7 @@ def _transcribe_via_server(wav_bytes: bytes, lang: str) -> str:
         return result.get("text", "").strip()
 
 
-def _transcribe_via_cli(audio_np: np.ndarray, lang: str) -> str:
+def _transcribe_via_cli(audio_np: np.ndarray, lang: str, prompt: str = "") -> str:
     """Transcribe via whisper-cli subprocess. Model loaded each time."""
     import tempfile
 
@@ -539,6 +606,8 @@ def _transcribe_via_cli(audio_np: np.ndarray, lang: str) -> str:
         ]
         if lang != "auto":
             whisper_cmd.extend(["-l", lang])
+        if prompt:
+            whisper_cmd.extend(["--prompt", prompt])
 
         r = subprocess.run(whisper_cmd, capture_output=True, timeout=30)
         text = r.stdout.decode("utf-8", errors="replace").strip()
@@ -570,19 +639,20 @@ def transcribe_chunk(model_unused, audio_np: np.ndarray) -> str:
         return ""
 
     lang = LANGUAGE if LANGUAGE != "auto" else "auto"
+    prompt = build_whisper_prompt()
     text = ""
 
     # Try whisper-server first (model in memory, ~10x faster)
     if _whisper_server_available:
         try:
             wav_bytes = _audio_to_wav_bytes(audio_np)
-            text = _transcribe_via_server(wav_bytes, lang)
+            text = _transcribe_via_server(wav_bytes, lang, prompt)
         except Exception as e:
             print(f"[meeting] Server transcription failed, falling back to CLI: {e}",
                   file=sys.stderr, flush=True)
-            text = _transcribe_via_cli(audio_np, lang)
+            text = _transcribe_via_cli(audio_np, lang, prompt)
     else:
-        text = _transcribe_via_cli(audio_np, lang)
+        text = _transcribe_via_cli(audio_np, lang, prompt)
 
     # Strip canned outros/sound events first — a chunk may hold real speech too
     text = _strip_hallucinations(text)

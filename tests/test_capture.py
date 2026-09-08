@@ -1149,3 +1149,133 @@ class TestModelResolution:
         monkeypatch.delenv("WHISPER_MODEL_PATH", raising=False)
         expected = f"ggml-{capture_mod.WHISPER_MODEL}.bin"
         assert capture_mod.resolve_model_path().name == expected
+
+
+# -- Tests for vocabulary biasing ----------------------------------------------
+
+class TestBuildWhisperPrompt:
+    """The initial prompt is where names and terms get fixed — in the decoder,
+    not afterwards by a model that cannot check its own work."""
+
+    def test_no_terms_gives_no_prompt(self):
+        assert capture_mod.build_whisper_prompt(participants=[], glossary=[]) == ""
+
+    def test_includes_glossary_and_participants(self):
+        p = capture_mod.build_whisper_prompt(participants=["Катя"],
+                                             glossary=["Claude Code"])
+        assert "Claude Code" in p and "Катя" in p
+
+    def test_participants_come_last(self):
+        """Later tokens weigh more, and a name is what whisper cannot guess."""
+        p = capture_mod.build_whisper_prompt(participants=["Валера"],
+                                             glossary=["MCP", "Researcher"])
+        assert p.index("Researcher") < p.index("Валера")
+
+    def test_deduplicates_case_insensitively(self):
+        p = capture_mod.build_whisper_prompt(participants=["catya"],
+                                             glossary=["Catya", "CATYA"])
+        assert p.lower().count("catya") == 1
+
+    def test_blank_entries_dropped(self):
+        p = capture_mod.build_whisper_prompt(participants=["  ", ""],
+                                             glossary=["MCP", "   "])
+        assert p.count(",") == 0 and "MCP" in p
+
+    def test_respects_the_224_token_budget(self):
+        p = capture_mod.build_whisper_prompt(
+            participants=["Валера"], glossary=[f"термин{i}" for i in range(300)])
+        assert len(p) <= capture_mod.WHISPER_PROMPT_MAX_CHARS
+
+    def test_trimming_keeps_the_tail(self):
+        """Front is dropped, because the end of the prompt is what carries."""
+        p = capture_mod.build_whisper_prompt(
+            participants=["Валера"], glossary=[f"термин{i}" for i in range(300)])
+        assert "Валера" in p
+        assert "термин0," not in p
+
+
+class TestGlossaryLoading:
+    def _with_config(self, tmp_path, body):
+        (tmp_path / "config.json").write_text(body, encoding="utf-8")
+        return patch.object(capture_mod, "CONFIG_FILE", tmp_path / "config.json")
+
+    def test_reads_a_list(self, tmp_path):
+        with self._with_config(tmp_path, '{"glossary": ["MCP", "Researcher"]}'):
+            assert capture_mod._load_glossary() == ["MCP", "Researcher"]
+
+    def test_reads_a_comma_string(self, tmp_path):
+        with self._with_config(tmp_path, '{"glossary": "MCP, Researcher"}'):
+            assert capture_mod._load_glossary() == ["MCP", "Researcher"]
+
+    def test_missing_key_is_empty(self, tmp_path):
+        with self._with_config(tmp_path, '{"language": "ru"}'):
+            assert capture_mod._load_glossary() == []
+
+    def test_malformed_config_is_empty(self, tmp_path):
+        with self._with_config(tmp_path, "{not json"):
+            assert capture_mod._load_glossary() == []
+
+    def test_absent_config_is_empty(self, tmp_path):
+        with patch.object(capture_mod, "CONFIG_FILE", tmp_path / "nope.json"):
+            assert capture_mod._load_glossary() == []
+
+
+class TestPromptReachesWhisper:
+    """Building the string is worthless if it never leaves the process."""
+
+    def test_server_request_carries_the_prompt(self):
+        captured = {}
+
+        class FakeResponse:
+            def read(self): return b'{"text": "ok"}'
+            def __enter__(self): return self
+            def __exit__(self, *a): return False
+
+        def fake_urlopen(req, timeout=None):
+            captured["body"] = req.data
+            return FakeResponse()
+
+        with patch("urllib.request.urlopen", fake_urlopen):
+            capture_mod._transcribe_via_server(b"RIFFfake", "ru", "Термины: MCP.")
+
+        body = captured["body"].decode("utf-8", errors="replace")
+        assert 'name="prompt"' in body
+        assert "Термины: MCP." in body
+
+    def test_server_request_omits_an_empty_prompt(self):
+        captured = {}
+
+        class FakeResponse:
+            def read(self): return b'{"text": "ok"}'
+            def __enter__(self): return self
+            def __exit__(self, *a): return False
+
+        def fake_urlopen(req, timeout=None):
+            captured["body"] = req.data
+            return FakeResponse()
+
+        with patch("urllib.request.urlopen", fake_urlopen):
+            capture_mod._transcribe_via_server(b"RIFFfake", "ru", "")
+
+        assert 'name="prompt"' not in captured["body"].decode("utf-8", errors="replace")
+
+    def test_cli_receives_prompt_flag(self):
+        audio = np.full(16000, 0.2, dtype=np.float32)
+        with patch("capture.subprocess.run") as run:
+            run.return_value = MagicMock(returncode=0, stdout=b"ok\n")
+            capture_mod._transcribe_via_cli(audio, "ru", "Термины: MCP.")
+        whisper_call = [c for c in run.call_args_list
+                        if "--prompt" in (c[0][0] if c[0] else [])]
+        assert whisper_call, "whisper-cli was not given --prompt"
+        cmd = whisper_call[0][0][0]
+        assert cmd[cmd.index("--prompt") + 1] == "Термины: MCP."
+
+    def test_transcribe_chunk_builds_and_forwards_the_prompt(self):
+        capture_mod._mix_noise.reset()
+        seen = {}
+        with patch.object(capture_mod, "build_whisper_prompt", return_value="P"), \
+             patch.object(capture_mod, "_transcribe_via_cli",
+                          side_effect=lambda a, l, p: seen.setdefault("prompt", p) or "text"):
+            capture_mod.transcribe_chunk(None, _speechlike(0.02))
+        assert seen["prompt"] == "P"
+        capture_mod._mix_noise.reset()

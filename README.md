@@ -51,6 +51,9 @@ Zoom Audio
 CoreAudio Process Tap (captures Zoom by bundle ID — no virtual driver)
     |
     v
+Vocabulary biasing (participant names + your glossary as the initial prompt)
+    |
+    v
 whisper.cpp large-v3-turbo (Metal GPU, model resident via whisper-server)
     |
     v
@@ -82,7 +85,7 @@ or changes length too far is rejected and the transcribed text is kept.
 curl -fsSL https://raw.githubusercontent.com/m0rvayne/ghostmic/main/install.sh | bash
 ```
 
-One command. Sets up everything: Python venv, whisper.cpp model, Qwen3 LLM, Claude Desktop config, LaunchAgent, menu bar indicator. No audio drivers to install.
+One command. Sets up everything: Python venv, whisper.cpp model, Claude Desktop config, LaunchAgent, menu bar indicator. No audio drivers to install.
 
 Then restart Claude Desktop (Cmd+Q → reopen). Done.
 
@@ -101,10 +104,31 @@ Settings available in the menu bar indicator (ghost icon → ⚙ Settings):
 
 | Setting | Default | Description |
 |---------|---------|-------------|
-| Whisper Model | `large-v3-turbo` | Model for transcription |
-| Speaker Labels | On | `[You]` vs `[Remote]` diarization |
+| Whisper Model | `large-v3-turbo` | Lists the models present in `~/.ghostmic/models` |
+| Speaker Labels | On | `[You]` / `[Remote]` / `[Both]` diarization |
 | Language | `ru` | Forced language (set `auto` for auto-detect) |
 | Save Path | `~/.ghostmic/transcripts` | Where transcripts are saved |
+
+### Glossary
+
+Names and domain terms go in `~/.ghostmic/config.json`:
+
+```json
+{ "glossary": ["Claude Code", "MCP", "майнд-карта", "Researcher"] }
+```
+
+These are fed to whisper as an initial prompt, which biases decoding toward the
+spelling you want. It is the difference between
+
+```
+without:  «Мы обсудили Клод Кот и Майнд Карту в Ресерчере»
+with:     «Мы обсудили Claude Code и Майнд-карту в Researcher»
+```
+
+Participant names detected from the Zoom window are appended automatically, and
+go last because the end of the prompt carries the most weight. Only the last 224
+tokens are used, so keep the list to terms whisper actually gets wrong. Edits
+take effect on the next chunk — no restart.
 
 ## Why ghostmic vs competitors
 
