@@ -39,7 +39,10 @@ BUNDLE_ID = os.environ.get("BUNDLE_ID", "us.zoom.xos")
 
 AUDIO_TAP_BIN = Path(__file__).parent / ".build" / "process-audio-tap"
 PARTICIPANTS_BIN = Path(__file__).parent / ".build" / "zoom-participants"
-ENABLE_LLM_POST = os.environ.get("LLM_POST", "1") == "1"
+# Off by default — measured net-negative on real chunks. See
+# tools/measure_llm_post.py and the note above _llm_output_is_safe.
+# Set LLM_POST=1 to opt in.
+ENABLE_LLM_POST = os.environ.get("LLM_POST", "0") == "1"
 
 # Bounded queues
 audio_queue = queue.Queue(maxsize=MAX_QUEUE_CHUNKS)
@@ -605,6 +608,34 @@ def _llm_generate(formatted_prompt: str, max_tokens: int = 150) -> str:
                     max_tokens=max_tokens, **kwargs)
 
 
+_THINK_BLOCK_RE = re.compile(r"<think>.*?</think>", re.DOTALL)
+
+
+def _strip_think_block(text: str) -> str:
+    """Remove Qwen3 reasoning blocks.
+
+    The `/no_think` hint in the prompt is not binding — the chat template
+    decides, and when it opens a <think> block the tags land in the output and
+    from there would land in the transcript.
+    """
+    return _THINK_BLOCK_RE.sub(" ", text).replace("<think>", " ").replace("</think>", " ").strip()
+
+
+def _llm_refine(clean_text: str, context: str, participants: list[str]) -> str:
+    """Run one post-processing pass. Returns the model's cleaned-up output."""
+    prompt = _build_llm_prompt(clean_text, context, participants)
+    messages = [{"role": "user", "content": prompt}]
+    try:
+        formatted = _llm_tokenizer.apply_chat_template(
+            messages, add_generation_prompt=True, tokenize=False,
+            enable_thinking=False)
+    except TypeError:
+        # Older templates have no such switch — _strip_think_block covers it.
+        formatted = _llm_tokenizer.apply_chat_template(
+            messages, add_generation_prompt=True, tokenize=False)
+    return _strip_think_block(_llm_generate(formatted).strip())
+
+
 def _load_llm():
     """Load micro LLM for transcript post-processing. Called once."""
     global _llm_model, _llm_tokenizer
@@ -618,6 +649,102 @@ def _load_llm():
     except Exception as e:
         print(f"[meeting] LLM not available: {e}. Using rule-based only.", file=sys.stderr, flush=True)
         return False
+
+
+def _build_llm_prompt(clean_text: str, context: str, participants: list[str]) -> str:
+    """The instruction handed to the post-processing model."""
+    participant_hint = ""
+    if participants:
+        names = ", ".join(participants)
+        participant_hint = f"""- Meeting participants: {names}
+- If you can identify who is speaking from context, prefix with [Name]
+- If multiple speakers in one chunk, split with newlines: [Name1] text\\n[Name2] text
+"""
+
+    return f"""Fix this speech-to-text transcript chunk using the context. Rules:
+- Fix obvious recognition errors based on context
+- If chunk starts mid-sentence (continuing previous), merge naturally
+- Keep it concise, output ONLY the corrected text
+- Keep the same language as input
+- Do NOT add anything not in the original
+{participant_hint}
+Context:
+{context}
+
+New chunk:
+{clean_text}
+
+/no_think
+Corrected:"""
+
+
+# The post-processor is a 0.6B model at 4-bit being asked to edit Russian
+# speech. Measured over 40 real chunks from the archive (tools/measure_llm_post.py):
+#
+#   35%  fabricated — output was unrelated dialogue continued from the context
+#        rather than a repair of the chunk. Caught here, by length or divergence.
+#   35%  returned unchanged.
+#   25%  edited, and the edit was almost always a silent truncation: the tail
+#        sentence of the chunk simply disappeared. One case introduced a typo
+#        into a correct word ("ожидаю" -> "ожидю").
+#    2%  a real repair.
+#
+# Truncation is the reason this stage is off by default. A garbled sentence is
+# visibly garbled; a dropped one leaves nothing behind to notice. Nothing
+# downstream can tell a repair from an invention, so when the stage is enabled
+# the burden is on its output to still look like its input.
+
+LLM_MAX_DIVERGENCE = 0.35     # normalised edit distance
+LLM_MIN_LENGTH_RATIO = 0.5
+LLM_MAX_LENGTH_RATIO = 1.8
+
+_DIGIT_RUN_RE = re.compile(r"\d+")
+_llm_rejections: dict[str, int] = {}
+
+
+def _levenshtein(a: str, b: str) -> int:
+    if a == b:
+        return 0
+    if not a:
+        return len(b)
+    if not b:
+        return len(a)
+    prev = list(range(len(b) + 1))
+    for i, ca in enumerate(a, 1):
+        cur = [i]
+        for j, cb in enumerate(b, 1):
+            cur.append(min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + (ca != cb)))
+        prev = cur
+    return prev[-1]
+
+
+def _llm_output_is_safe(original: str, candidate: str) -> tuple[bool, str]:
+    """True if `candidate` reads as a repair of `original` rather than a rewrite."""
+    if not candidate or len(candidate) < 5:
+        return False, "too-short"
+    if _is_hallucination(candidate):
+        return False, "hallucination"
+
+    ratio = len(candidate) / max(len(original), 1)
+    if not (LLM_MIN_LENGTH_RATIO <= ratio <= LLM_MAX_LENGTH_RATIO):
+        return False, "length"
+
+    # Figures are the one thing nobody can sanity-check later from the text.
+    if any(d not in candidate for d in _DIGIT_RUN_RE.findall(original)):
+        return False, "dropped-number"
+
+    if _levenshtein(original, candidate) / max(len(original), 1) > LLM_MAX_DIVERGENCE:
+        return False, "divergence"
+
+    return True, ""
+
+
+def _note_llm_rejection(reason: str):
+    first = reason not in _llm_rejections
+    _llm_rejections[reason] = _llm_rejections.get(reason, 0) + 1
+    if first:
+        print(f"[meeting] LLM post-processing rejected a result ({reason}) — "
+              f"keeping the transcribed text", file=sys.stderr, flush=True)
 
 
 def _postprocess_text(text: str, timestamp: str) -> str:
@@ -647,37 +774,12 @@ def _postprocess_text(text: str, timestamp: str) -> str:
         global _llm_error_logged
         try:
             context = "\n".join(_prev_chunks[-3:])
-
-            # Build participant-aware prompt
-            participants = get_remote_participants()
-            participant_hint = ""
-            if participants:
-                names = ", ".join(participants)
-                participant_hint = f"""- Meeting participants: {names}
-- If you can identify who is speaking from context, prefix with [Name]
-- If multiple speakers in one chunk, split with newlines: [Name1] text\\n[Name2] text
-"""
-
-            prompt = f"""Fix this speech-to-text transcript chunk using the context. Rules:
-- Fix obvious recognition errors based on context
-- If chunk starts mid-sentence (continuing previous), merge naturally
-- Keep it concise, output ONLY the corrected text
-- Keep the same language as input
-- Do NOT add anything not in the original
-{participant_hint}
-Context:
-{context}
-
-New chunk:
-{clean_text}
-
-/no_think
-Corrected:"""
-            messages = [{"role": "user", "content": prompt}]
-            formatted = _llm_tokenizer.apply_chat_template(messages, add_generation_prompt=True, tokenize=False)
-            result = _llm_generate(formatted).strip()
-            if result and len(result) > 5 and not _is_hallucination(result):
+            result = _llm_refine(clean_text, context, get_remote_participants())
+            accepted, reason = _llm_output_is_safe(clean_text, result)
+            if accepted:
                 clean_text = result
+            else:
+                _note_llm_rejection(reason)
         except Exception as e:
             # Never fail the transcript over post-processing — but say so once,
             # otherwise a broken LLM stage stays invisible for months.

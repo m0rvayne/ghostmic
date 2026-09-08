@@ -35,11 +35,11 @@ Your conversations go to their cloud. Everyone on the call sees the bot. People 
 ## How it works
 
 - **Invisible.** No bot joins the call. CoreAudio Process Taps capture Zoom audio at the system level — no virtual drivers, no speaker changes.
-- **Two-stage AI.** whisper.cpp (large-v3-turbo) transcribes with Metal GPU in ~3 seconds. Then Qwen3-0.6B micro LLM refines the text — fixes recognition errors, merges sentence fragments, maintains speaker continuity across chunks.
+- **Local transcription.** whisper.cpp (large-v3-turbo) with Metal GPU, model resident in memory via whisper-server. Canned-outro and sound-annotation filtering tuned on 1300+ real transcripts.
 - **Live to Claude.** Transcript updates every ~15 seconds. Ask Claude anything mid-meeting.
 - **Zero config.** No BlackHole, no Multi-Output Device, no Zoom speaker settings. Plug in any headphones, switch anytime — recording never breaks.
 - **Auto-detection.** Background daemon detects Zoom calls. No buttons to press.
-- **Speaker labels.** `[You]` vs `[Remote]` via dual-channel energy comparison. Mic auto-silences when you're muted in Zoom — private conversations stay private.
+- **Speaker labels.** `[You]`, `[Remote]` and `[Both]`, from how far each channel sits above its own noise floor — so the labels survive a volume or mic-gain change mid-call. Mic auto-silences when you're muted in Zoom — private conversations stay private.
 - **Menu bar app.** Ghost icon with pause/stop controls, live timer, settings.
 
 ## The AI pipeline
@@ -51,16 +51,30 @@ Zoom Audio
 CoreAudio Process Tap (captures Zoom by bundle ID — no virtual driver)
     |
     v
-whisper.cpp large-v3-turbo (Metal GPU, ~3s per 10s chunk)
+whisper.cpp large-v3-turbo (Metal GPU, model resident via whisper-server)
     |
     v
-Qwen3-0.6B micro LLM (fixes errors, merges fragments, speaker continuity)
+Rule-based cleanup (canned outros, sound annotations, repetition)
     |
     v
 Transcript file ──> server.py (MCP) ──> Claude Desktop / Claude Code
 ```
 
-Most transcription tools stop at step 3. We add a micro LLM that reads the last 3 chunks as context and fixes what Whisper got wrong — misheard terms, sentence fragments split across chunk boundaries, repeated speaker labels. The result reads like someone actually took notes.
+### About the optional LLM pass
+
+There is a Qwen3-0.6B post-processing stage behind `LLM_POST=1`. It is **off by
+default**, because it was measured and it did not earn its place.
+
+Over 40 real chunks (`tools/measure_llm_post.py`): 35% of the time the model
+produced unrelated dialogue continued from the surrounding context instead of a
+repair; 35% returned the text unchanged; most of the remaining edits silently
+dropped the last sentence of the chunk, and one introduced a typo into a word
+that had been correct. One edit in forty was a genuine fix.
+
+Silent truncation is the reason it stays off. A garbled sentence is visibly
+garbled and you can go listen again; a dropped one leaves nothing to notice.
+If you enable it anyway, output that changes the text too much, loses a number,
+or changes length too far is rejected and the transcribed text is kept.
 
 ## Install
 
@@ -100,7 +114,7 @@ Settings available in the menu bar indicator (ghost icon → ⚙ Settings):
 | **Privacy** | Audio goes to their cloud | Never leaves your Mac |
 | **Audio setup** | None (bot captures) | None (CoreAudio tap) |
 | **Headphone switching** | N/A | No impact on recording |
-| **AI quality** | Cloud LLM | whisper.cpp + Qwen3 LLM post-processing |
+| **Transcription** | Cloud ASR | whisper.cpp large-v3-turbo, on-device |
 | **Claude integration** | None | Native MCP — live transcript in Claude |
 | **Cost** | $15-30/month | Free, open source |
 
@@ -110,6 +124,7 @@ Settings available in the menu bar indicator (ghost icon → ⚙ Settings):
 - **macOS 14.4+.** Requires CoreAudio Process Taps API.
 - **~15 second latency.** Audio chunks processed every ~10 seconds + AI pipeline.
 - **Two-party speaker labels.** Cannot distinguish multiple remote speakers by voice.
+- **No LLM cleanup by default.** The transcript is what Whisper heard, filtered for known artefacts — readable, but not polished prose.
 
 <details>
 <summary><strong>Troubleshooting</strong></summary>

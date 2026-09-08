@@ -1010,3 +1010,116 @@ class TestGateRegression:
         # would have discarded the whole conversation.
         capture_mod._mix_noise.observe(_room_tone(0.0002))
         assert self._transcribes(_speechlike(0.003))
+
+
+# -- Tests for the LLM post-processing guard -----------------------------------
+
+class TestStripThinkBlock:
+    """Qwen3 opens a reasoning block regardless of the /no_think hint."""
+
+    def test_removes_block_and_contents(self):
+        out = capture_mod._strip_think_block("<think>\n\n</think>\n\nРеальный текст")
+        assert out == "Реальный текст"
+
+    def test_removes_multiline_reasoning(self):
+        out = capture_mod._strip_think_block("<think>a\nb\nc</think> текст")
+        assert out == "текст"
+
+    def test_removes_unclosed_tag(self):
+        assert "think" not in capture_mod._strip_think_block("<think> текст")
+
+    def test_plain_text_untouched(self):
+        assert capture_mod._strip_think_block("просто текст") == "просто текст"
+
+
+class TestLevenshtein:
+    def test_identical(self):
+        assert capture_mod._levenshtein("абв", "абв") == 0
+
+    def test_empty_sides(self):
+        assert capture_mod._levenshtein("", "абв") == 3
+        assert capture_mod._levenshtein("абв", "") == 3
+
+    def test_single_substitution(self):
+        assert capture_mod._levenshtein("кот", "кит") == 1
+
+    def test_insertion(self):
+        assert capture_mod._levenshtein("кот", "коты") == 1
+
+
+class TestLLMOutputGuard:
+    """What may replace the transcribed text, and what may not."""
+
+    ORIGINAL = ("Давайте зафиксируем: бюджет 250 тысяч, срок до пятницы, "
+                "ответственный Андрей.")
+
+    def test_accepts_a_light_repair(self):
+        candidate = ("Давайте зафиксируем: бюджет 250 тысяч, срок до пятницы, "
+                     "ответственный Андрей.")
+        assert capture_mod._llm_output_is_safe(self.ORIGINAL, candidate)[0]
+
+    def test_accepts_small_grammar_fix(self):
+        original = "просто будут элементы"
+        assert capture_mod._llm_output_is_safe(original, "просто были элементы")[0]
+
+    def test_rejects_dropped_number(self):
+        candidate = ("Давайте зафиксируем: бюджет, срок до пятницы, "
+                     "ответственный Андрей.")
+        ok, reason = capture_mod._llm_output_is_safe(self.ORIGINAL, candidate)
+        assert not ok and reason == "dropped-number"
+
+    def test_rejects_changed_number(self):
+        candidate = self.ORIGINAL.replace("250", "150")
+        ok, reason = capture_mod._llm_output_is_safe(self.ORIGINAL, candidate)
+        assert not ok and reason == "dropped-number"
+
+    def test_rejects_truncation(self):
+        """The most common real failure: the tail sentence disappears."""
+        ok, reason = capture_mod._llm_output_is_safe(
+            self.ORIGINAL, "Давайте зафиксируем: бюджет 250 тысяч.")
+        assert not ok and reason == "length"
+
+    def test_rejects_continuation_of_the_conversation(self):
+        """Observed 14 times in 40 — output is fresh dialogue, not a repair."""
+        ok, reason = capture_mod._llm_output_is_safe(
+            "Спасибо за субтитры Алексею Дубровскому!",
+            "Я не говорю, что это делать не надо. Просто у нас смещается фокус. "
+            "Мы долго говорили. Делаем первую версию, чтобы оно работало локально.")
+        assert not ok and reason == "length"
+
+    def test_rejects_rewrite_of_similar_length(self):
+        ok, reason = capture_mod._llm_output_is_safe(
+            "Смотри, у тебя есть дочерние элементы, называются Info и Scope.",
+            "Твоей задачей будет до завтра привести остальные проекты в порядок.")
+        assert not ok and reason == "divergence"
+
+    def test_rejects_empty_and_tiny(self):
+        assert not capture_mod._llm_output_is_safe(self.ORIGINAL, "")[0]
+        assert not capture_mod._llm_output_is_safe(self.ORIGINAL, "ок")[0]
+
+    def test_rejects_hallucination(self):
+        ok, reason = capture_mod._llm_output_is_safe(
+            "мы обсудили бюджет на следующий квартал подробно",
+            "Спасибо за просмотр, подписывайтесь на канал!")
+        assert not ok and reason == "hallucination"
+
+    def test_rejection_reasons_are_counted_once_per_kind(self):
+        capture_mod._llm_rejections.clear()
+        capture_mod._note_llm_rejection("length")
+        capture_mod._note_llm_rejection("length")
+        capture_mod._note_llm_rejection("divergence")
+        assert capture_mod._llm_rejections == {"length": 2, "divergence": 1}
+        capture_mod._llm_rejections.clear()
+
+
+class TestLLMPostDisabledByDefault:
+    def test_off_unless_opted_in(self):
+        """Measured net-negative — it must not come back on by accident."""
+        import importlib, os
+        saved = os.environ.pop("LLM_POST", None)
+        try:
+            assert importlib.reload(capture_mod).ENABLE_LLM_POST is False
+        finally:
+            if saved is not None:
+                os.environ["LLM_POST"] = saved
+            importlib.reload(capture_mod)
