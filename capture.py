@@ -293,7 +293,17 @@ def resolve_model_path(name: str | None = None) -> Path:
     override = os.environ.get("WHISPER_MODEL_PATH")
     if override:
         return Path(override)
-    return MODELS_DIR / f"ggml-{name or WHISPER_MODEL}.bin"
+    wanted = MODELS_DIR / f"ggml-{name or WHISPER_MODEL}.bin"
+    if wanted.exists():
+        return wanted
+    # A name pointing at a file that is not there must not end the recording.
+    # Say so and use what is on disk.
+    available = sorted(MODELS_DIR.glob("ggml-*.bin"))
+    if available:
+        print(f"[meeting] Model {wanted.name} not installed — using {available[0].name}",
+              file=sys.stderr, flush=True)
+        return available[0]
+    return wanted  # nothing installed; the caller reports the missing file
 
 
 WHISPER_MODEL_PATH = str(resolve_model_path())

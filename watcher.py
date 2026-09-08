@@ -290,8 +290,15 @@ def whisper_settings(config: WatcherConfig, user_cfg: dict) -> tuple[str, str]:
     name = (user_cfg.get("whisper_model")
             or os.environ.get("WHISPER_MODEL")
             or DEFAULT_WHISPER_MODEL)
-    path = (os.environ.get("WHISPER_MODEL_PATH")
-            or str(config.install_dir / "models" / f"ggml-{name}.bin"))
+    override = os.environ.get("WHISPER_MODEL_PATH")
+    path = override or str(config.install_dir / "models" / f"ggml-{name}.bin")
+    if not override and not Path(path).exists():
+        # The menu bar can name a model that was never downloaded. Falling back
+        # beats refusing to record.
+        available = sorted((config.install_dir / "models").glob("ggml-*.bin"))
+        if available:
+            logger.warning(f"Model ggml-{name}.bin not installed — using {available[0].name}")
+            path = str(available[0])
     language = user_cfg.get("language", os.environ.get("LANGUAGE", "auto"))
     return path, language
 

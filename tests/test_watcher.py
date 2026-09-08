@@ -616,3 +616,32 @@ class TestBuildStamp:
     def test_malformed_file_does_not_raise(self, tmp_path):
         (tmp_path / "build-info.json").write_text("{not json")
         assert "unknown" in watcher.build_stamp(tmp_path)
+
+
+class TestMissingModelFallback:
+    """Naming a model that was never downloaded must not stop the recording."""
+
+    def _config(self, tmp_path, present):
+        (tmp_path / "models").mkdir(exist_ok=True)
+        for name in present:
+            (tmp_path / "models" / f"ggml-{name}.bin").write_bytes(b"x")
+        cfg = watcher.default_config()
+        return watcher.WatcherConfig(**{**cfg.__dict__, "install_dir": tmp_path})
+
+    def test_falls_back_to_what_is_installed(self, tmp_path, monkeypatch):
+        monkeypatch.delenv("WHISPER_MODEL_PATH", raising=False)
+        cfg = self._config(tmp_path, ["large-v3-turbo"])
+        path, _ = watcher.whisper_settings(cfg, {"whisper_model": "medium"})
+        assert path.endswith("ggml-large-v3-turbo.bin")
+
+    def test_uses_the_named_model_when_present(self, tmp_path, monkeypatch):
+        monkeypatch.delenv("WHISPER_MODEL_PATH", raising=False)
+        cfg = self._config(tmp_path, ["medium", "large-v3-turbo"])
+        path, _ = watcher.whisper_settings(cfg, {"whisper_model": "medium"})
+        assert path.endswith("ggml-medium.bin")
+
+    def test_nothing_installed_keeps_the_named_path(self, tmp_path, monkeypatch):
+        monkeypatch.delenv("WHISPER_MODEL_PATH", raising=False)
+        cfg = self._config(tmp_path, [])
+        path, _ = watcher.whisper_settings(cfg, {"whisper_model": "medium"})
+        assert path.endswith("ggml-medium.bin")  # caller reports it missing
