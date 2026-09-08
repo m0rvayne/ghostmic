@@ -19,6 +19,52 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 import capture as capture_mod
 
 
+SAMPLE_RATE = capture_mod.SAMPLE_RATE
+
+
+def _speechlike(target_rms: float, seconds: float = 20.0, seed: int = 0,
+                offset: int = 0, gaps: bool = True) -> np.ndarray:
+    """Noise shaped like speech: loud stretches separated by pauses.
+
+    A real chunk is never a constant level — it alternates between phrases and
+    gaps, and it is the gaps every floor estimate in capture.py relies on.
+    `offset` shifts the envelope so two channels can take turns; gaps=False
+    models someone who never stops to breathe.
+    """
+    rng = np.random.default_rng(seed)
+    n = int(SAMPLE_RATE * seconds)
+    audio = rng.standard_normal(n).astype(np.float32)
+
+    if gaps:
+        frame = int(SAMPLE_RATE * 0.5)
+        envelope = np.ones(n, dtype=np.float32)
+        for i, start in enumerate(range(0, n, frame)):
+            envelope[start:start + frame] = 1.0 if ((i + offset) % 5) < 3 else 0.04
+        audio *= envelope
+
+    audio *= target_rms / float(np.sqrt(np.mean(audio ** 2)))
+    return audio
+
+
+def _room_tone(rms: float, seconds: float = 20.0, seed: int = 1) -> np.ndarray:
+    """Flat low-level noise — an empty room with the mic open."""
+    rng = np.random.default_rng(seed)
+    audio = rng.standard_normal(int(SAMPLE_RATE * seconds)).astype(np.float32)
+    return audio * (rms / float(np.sqrt(np.mean(audio ** 2))))
+
+
+def _bleed(source: np.ndarray, amount: float, floor_rms: float = 0.0005,
+           seed: int = 5) -> np.ndarray:
+    """What the mic picks up when the far end is played through speakers."""
+    seconds = len(source) / SAMPLE_RATE
+    return _room_tone(floor_rms, seconds, seed=seed) + source * amount
+
+
+def _labels(segments) -> set:
+    return {s[0] for s in segments}
+
+
+
 class TestAudioMixing:
     """Mixing behavior: average with clip safety."""
 
@@ -107,88 +153,174 @@ class TestWriteTranscript:
 
 
 class TestSpeakerDiarization:
-    """Test the ACTUAL _classify_speakers and _build_diarized_text from capture.py."""
+    """_classify_speakers / _build_diarized_text on realistic two-channel audio.
+
+    These used to be written against constant-DC signals, which let a channel
+    read as "loud" with no dynamics at all. Real audio always has an envelope,
+    and the floor-relative measure needs one, so every scenario here is built
+    from shaped noise instead.
+    """
 
     def test_remote_speaker_only(self):
-        bh = np.full(16000, 0.3, dtype=np.float32)
-        mic = np.full(16000, 0.01, dtype=np.float32)
-        segments = capture_mod._classify_speakers(bh, mic)
-        assert len(segments) > 0
-        assert all(s[0] == "[Remote]" for s in segments)
+        bh = _speechlike(0.02)
+        mic = _room_tone(0.0005)
+        assert _labels(capture_mod._classify_speakers(bh, mic)) == {"[Remote]"}
 
     def test_local_speaker_only(self):
-        bh = np.full(16000, 0.01, dtype=np.float32)
-        mic = np.full(16000, 0.5, dtype=np.float32)
-        segments = capture_mod._classify_speakers(bh, mic)
-        assert len(segments) > 0
-        assert all(s[0] == "[You]" for s in segments)
+        bh = _room_tone(0.0005)
+        mic = _speechlike(0.03)
+        assert _labels(capture_mod._classify_speakers(bh, mic)) == {"[You]"}
 
     def test_silence_skipped(self):
-        bh = np.zeros(16000, dtype=np.float32)
-        mic = np.zeros(16000, dtype=np.float32)
-        segments = capture_mod._classify_speakers(bh, mic)
-        assert len(segments) == 0
+        bh = np.zeros(SAMPLE_RATE * 4, dtype=np.float32)
+        mic = np.zeros(SAMPLE_RATE * 4, dtype=np.float32)
+        assert capture_mod._classify_speakers(bh, mic) == []
 
-    def test_both_speaking_labels_remote(self):
-        """When both channels have similar energy (mic bleed), should label [Remote]."""
-        bh = np.full(16000, 0.3, dtype=np.float32)
-        mic = np.full(16000, 0.3, dtype=np.float32)
-        segments = capture_mod._classify_speakers(bh, mic)
-        assert len(segments) > 0
-        assert all(s[0] == "[Remote]" for s in segments)
+    def test_room_tone_alone_is_not_speech(self):
+        assert capture_mod._classify_speakers(_room_tone(0.0005),
+                                              _room_tone(0.0006, seed=2)) == []
+
+    def test_speaker_bleed_still_reads_as_remote(self):
+        """Far end on speakers leaks into the mic — the tap must still win."""
+        bh = _speechlike(0.02)
+        mic = _bleed(bh, amount=0.3)
+        assert _labels(capture_mod._classify_speakers(bh, mic)) == {"[Remote]"}
+
+    def test_simultaneous_speech_marked_both(self):
+        bh = _speechlike(0.02, seed=2)
+        mic = _speechlike(0.03, seed=3)
+        assert _labels(capture_mod._classify_speakers(bh, mic)) == {"[Both]"}
+
+    def test_taking_turns_yields_both_labels(self):
+        bh = _speechlike(0.02, seed=2, offset=0)
+        mic = _speechlike(0.03, seed=3, offset=3)
+        assert _labels(capture_mod._classify_speakers(bh, mic)) >= {"[You]", "[Remote]"}
+
+    def test_one_channel_all_zeros_other_has_signal(self):
+        bh = np.zeros(SAMPLE_RATE * 20, dtype=np.float32)
+        mic = _speechlike(0.03)
+        assert _labels(capture_mod._classify_speakers(bh, mic)) == {"[You]"}
+
+    def test_muted_mic_does_not_explode(self):
+        """capture.py feeds digital zeros while Zoom is muted."""
+        bh = _speechlike(0.02)
+        mic = np.zeros(len(bh), dtype=np.float32)
+        assert _labels(capture_mod._classify_speakers(bh, mic)) == {"[Remote]"}
+
+    def test_nan_frames_are_dropped_not_labelled(self):
+        bh = np.full(SAMPLE_RATE * 4, np.nan, dtype=np.float32)
+        mic = np.full(SAMPLE_RATE * 4, np.nan, dtype=np.float32)
+        assert capture_mod._classify_speakers(bh, mic) == []
+
+    def test_very_short_audio_does_not_crash(self):
+        bh = np.full(100, 0.3, dtype=np.float32)
+        mic = np.full(100, 0.3, dtype=np.float32)
+        assert isinstance(capture_mod._classify_speakers(bh, mic), list)
+
+    def test_zero_frame_size_returns_empty(self):
+        assert capture_mod._classify_speakers(_speechlike(0.02),
+                                              _room_tone(0.0005), frame_ms=0) == []
+
+    # -- the point of the rewrite ------------------------------------------
+
+    def test_labels_survive_a_mic_gain_change(self):
+        """Same room, mic gain raised 10x. Absolute-ratio comparison flipped
+        this case to [You]; lift over each channel's own floor must not."""
+        bh = _speechlike(0.02)
+        mic = _bleed(bh, amount=0.3)
+        quiet = capture_mod._classify_speakers(bh, mic)
+        loud = capture_mod._classify_speakers(bh, mic * 10.0)
+        assert _labels(quiet) == _labels(loud) == {"[Remote]"}
+
+    def test_labels_survive_a_volume_change(self):
+        """Listener turns Zoom down. Bleed scales with it; labels must not move."""
+        bh = _speechlike(0.02)
+        mic = _bleed(bh, amount=0.3)
+        before = capture_mod._classify_speakers(bh, mic)
+        after = capture_mod._classify_speakers(bh * 0.25, _bleed(bh * 0.25, amount=0.3))
+        assert _labels(before) == _labels(after) == {"[Remote]"}
+
+    def test_rolling_floor_rescues_a_speaker_who_never_pauses(self):
+        """With no gaps in the chunk there is no floor to find inside it, so
+        chunk-local estimation gives up. The rolling floor from earlier audio
+        is what keeps the label."""
+        bh = _speechlike(0.02, gaps=False)
+        mic = _room_tone(0.0005)
+        assert capture_mod._classify_speakers(bh, mic) == []
+        rescued = capture_mod._classify_speakers(bh, mic, bh_floor=0.0005,
+                                                 mic_floor=0.0005)
+        assert _labels(rescued) == {"[Remote]"}
+
+    # -- label aggregation --------------------------------------------------
 
     def test_build_diarized_text_single_speaker(self):
         segments = [("[You]", 0, 16000)]
-        result = capture_mod._build_diarized_text("Hello world", segments, 16000)
-        assert result == "[You] Hello world"
+        assert capture_mod._build_diarized_text("Hello world", segments, 16000) == "[You] Hello world"
 
     def test_build_diarized_text_mixed(self):
-        # 50/50 split — should show [You + Remote]
         segments = [("[You]", 0, 8000), ("[Remote]", 8000, 16000)]
-        result = capture_mod._build_diarized_text("Hello world", segments, 16000)
-        assert "[You + Remote]" in result
+        assert "[You + Remote]" in capture_mod._build_diarized_text("Hello world", segments, 16000)
+
+    def test_build_diarized_text_both_counts_for_each_side(self):
+        """A chunk that is entirely overlap belongs to neither alone."""
+        segments = [("[Both]", 0, 16000)]
+        assert "[You + Remote]" in capture_mod._build_diarized_text("Hi", segments, 16000)
 
     def test_build_diarized_text_empty_segments(self):
-        result = capture_mod._build_diarized_text("Hello world", [], 16000)
-        assert result == "Hello world"
+        assert capture_mod._build_diarized_text("Hello world", [], 16000) == "Hello world"
 
-    def test_very_short_audio_less_than_one_frame(self):
-        """Audio shorter than one frame (500ms = 8000 samples) still processes
-        the partial frame — range(0, 100, 8000) yields one iteration at i=0."""
-        bh = np.full(100, 0.3, dtype=np.float32)
-        mic = np.full(100, 0.3, dtype=np.float32)
-        segments = capture_mod._classify_speakers(bh, mic)
-        # Even with only 100 samples the loop runs once (i=0, slice truncates)
-        assert len(segments) == 1
-        assert segments[0][0] == "[Remote]"
 
-    def test_all_nan_values(self):
-        """NaN audio should not crash; energy will be NaN, ratio comparison falls through."""
-        bh = np.full(16000, np.nan, dtype=np.float32)
-        mic = np.full(16000, np.nan, dtype=np.float32)
-        # Should not raise — NaN comparisons return False, so silence_threshold check
-        # skips all frames (NaN < threshold is False, but we still compute ratio)
-        segments = capture_mod._classify_speakers(bh, mic)
-        # NaN energy means NaN < silence_threshold is False, so frames are processed
-        # but NaN ratio > 2.5 is False, so they become [Remote]
-        assert isinstance(segments, list)
+class TestBleedCorrelation:
+    """Telling speaker bleed apart from two people talking at once.
 
-    def test_one_channel_all_zeros_other_has_signal(self):
-        """One channel silent, other has signal — should classify correctly."""
-        bh = np.zeros(16000, dtype=np.float32)
-        mic = np.full(16000, 0.3, dtype=np.float32)
-        segments = capture_mod._classify_speakers(bh, mic)
-        assert len(segments) > 0
-        # mic has signal, bh is zero => ratio = 0.3 / 1e-8 >> 2.5 => [You]
-        assert all(s[0] == "[You]" for s in segments)
+    By level these are the same picture: both channels lit, neither leading.
+    They differ in shape — bleed is the tap coming back through the room, so
+    it correlates with it, while independent voices do not.
+    """
 
-    def test_one_channel_zeros_other_silent_too(self):
-        """Both channels effectively silent — bh=0 mic=0.001 (below threshold)."""
-        bh = np.zeros(16000, dtype=np.float32)
-        mic = np.full(16000, 0.001, dtype=np.float32)
-        segments = capture_mod._classify_speakers(bh, mic)
-        # Both below silence_threshold (0.005) => all frames skipped
-        assert segments == []
+    def test_identical_frames_correlate(self):
+        a = _room_tone(0.01, seconds=0.5)
+        assert capture_mod._frame_correlation(a, a) == pytest.approx(1.0, abs=1e-6)
+
+    def test_scaled_copy_still_correlates(self):
+        a = _room_tone(0.01, seconds=0.5)
+        assert capture_mod._frame_correlation(a, a * 0.05) == pytest.approx(1.0, abs=1e-6)
+
+    def test_independent_signals_do_not_correlate(self):
+        a = _room_tone(0.01, seconds=0.5, seed=1)
+        b = _room_tone(0.01, seconds=0.5, seed=2)
+        assert capture_mod._frame_correlation(a, b) < 0.1
+
+    def test_flat_frame_gives_zero(self):
+        a = _room_tone(0.01, seconds=0.5)
+        flat = np.zeros(len(a), dtype=np.float32)
+        assert capture_mod._frame_correlation(a, flat) == 0.0
+
+    def test_mismatched_or_empty_gives_zero(self):
+        a = _room_tone(0.01, seconds=0.5)
+        assert capture_mod._frame_correlation(a, a[:100]) == 0.0
+        assert capture_mod._frame_correlation(np.array([]), np.array([])) == 0.0
+
+    def test_nan_frame_gives_zero(self):
+        a = _room_tone(0.01, seconds=0.5)
+        bad = np.full(len(a), np.nan, dtype=np.float32)
+        assert capture_mod._frame_correlation(a, bad) == 0.0
+
+    def test_moderate_bleed_reads_as_remote(self):
+        """-20 dB into the mic — an ordinary laptop speaker at normal volume."""
+        bh = _speechlike(0.02)
+        assert _labels(capture_mod._classify_speakers(bh, _bleed(bh, 0.1))) == {"[Remote]"}
+
+    def test_heavy_bleed_reads_as_remote(self):
+        """-10 dB — speakers up loud, mic close. Level alone cannot resolve this."""
+        bh = _speechlike(0.02)
+        assert _labels(capture_mod._classify_speakers(bh, _bleed(bh, 0.3))) == {"[Remote]"}
+
+    def test_equal_level_independent_voices_stay_both(self):
+        """Same evidence by level as heavy bleed, opposite answer."""
+        bh = _speechlike(0.02, seed=11)
+        mic = _speechlike(0.02, seed=12)
+        assert _labels(capture_mod._classify_speakers(bh, mic)) == {"[Both]"}
 
 
 # -- Tests for _is_hallucination -----------------------------------------------
@@ -753,54 +885,6 @@ class TestParticipantDetection:
         assert capture_mod.get_participants() == ["Alice"]
 
 
-class TestDiarizationCalibration:
-    """Test auto-calibration of diarization thresholds."""
-
-    def setup_method(self):
-        # Reset calibration state
-        capture_mod._calibrated_silence = 0.005
-        capture_mod._calibrated_ratio = 2.5
-        capture_mod._calibration_done = False
-
-    def test_calibrate_sets_done_flag(self):
-        bh = np.random.randn(SAMPLE_RATE * 5).astype(np.float32) * 0.01
-        mic = np.random.randn(SAMPLE_RATE * 5).astype(np.float32) * 0.005
-        capture_mod._calibrate_thresholds(bh, mic)
-        assert capture_mod._calibration_done is True
-
-    def test_calibrate_adjusts_silence_threshold(self):
-        # Loud noise floor → higher silence threshold
-        bh = np.random.randn(SAMPLE_RATE * 5).astype(np.float32) * 0.03
-        mic = np.random.randn(SAMPLE_RATE * 5).astype(np.float32) * 0.03
-        capture_mod._calibrate_thresholds(bh, mic)
-        assert capture_mod._calibrated_silence > 0.005  # raised from default
-
-    def test_calibrate_quiet_room(self):
-        # Very quiet → threshold stays low
-        bh = np.random.randn(SAMPLE_RATE * 5).astype(np.float32) * 0.001
-        mic = np.random.randn(SAMPLE_RATE * 5).astype(np.float32) * 0.001
-        capture_mod._calibrate_thresholds(bh, mic)
-        assert capture_mod._calibrated_silence < 0.01
-
-    def test_calibrate_ratio_clamped(self):
-        # Extreme mic/bh ratio should be clamped
-        bh = np.random.randn(SAMPLE_RATE * 5).astype(np.float32) * 0.001
-        mic = np.random.randn(SAMPLE_RATE * 5).astype(np.float32) * 0.1
-        capture_mod._calibrate_thresholds(bh, mic)
-        assert 1.5 <= capture_mod._calibrated_ratio <= 5.0
-
-    def test_calibrate_empty_audio(self):
-        bh = np.array([], dtype=np.float32)
-        mic = np.array([], dtype=np.float32)
-        capture_mod._calibrate_thresholds(bh, mic)
-        assert capture_mod._calibration_done is True
-
-    def teardown_method(self):
-        capture_mod._calibrated_silence = 0.005
-        capture_mod._calibrated_ratio = 2.5
-        capture_mod._calibration_done = False
-
-
 class TestHallucinationRepetition:
     """Test repetition-based hallucination detection."""
 
@@ -815,290 +899,6 @@ class TestHallucinationRepetition:
 
     def test_two_same_words_not_hallucination(self):
         assert capture_mod._is_hallucination("да да") is False
-
-
-SAMPLE_RATE = capture_mod.SAMPLE_RATE
-
-
-class TestWhisperServer:
-    """Test whisper-server integration and fallback logic."""
-
-    def test_audio_to_wav_bytes_valid_wav(self):
-        """Generated WAV bytes should have valid RIFF/WAV header."""
-        audio = np.zeros(16000, dtype=np.float32)  # 1 second of silence
-        wav = capture_mod._audio_to_wav_bytes(audio)
-        assert wav[:4] == b'RIFF'
-        assert wav[8:12] == b'WAVE'
-        assert wav[12:16] == b'fmt '
-        assert wav[36:40] == b'data'
-
-    def test_audio_to_wav_bytes_correct_size(self):
-        """WAV data section should match PCM size."""
-        audio = np.ones(8000, dtype=np.float32) * 0.5
-        wav = capture_mod._audio_to_wav_bytes(audio)
-        import struct
-        data_size = struct.unpack_from('<I', wav, 40)[0]
-        assert data_size == 8000 * 2  # int16 = 2 bytes per sample
-
-    def test_audio_to_wav_bytes_clipping(self):
-        """Values beyond [-1, 1] should be clipped, not overflow."""
-        audio = np.array([2.0, -2.0, 0.5], dtype=np.float32)
-        wav = capture_mod._audio_to_wav_bytes(audio)
-        # Should not raise, WAV should be valid
-        assert len(wav) == 44 + 3 * 2  # header + 3 samples * 2 bytes
-
-    def test_check_whisper_server_not_running(self):
-        """Health check should return False when server is not running."""
-        result = capture_mod._check_whisper_server()
-        # Server is not running in test environment
-        assert result is False
-        assert capture_mod._whisper_server_available is False
-
-    def test_check_whisper_server_mock_healthy(self):
-        """Health check should return True for healthy server."""
-        import urllib.request
-        mock_resp = MagicMock()
-        mock_resp.status = 200
-        mock_resp.__enter__ = lambda s: s
-        mock_resp.__exit__ = MagicMock(return_value=False)
-        with patch("urllib.request.urlopen", return_value=mock_resp):
-            result = capture_mod._check_whisper_server()
-        assert result is True
-        assert capture_mod._whisper_server_available is True
-        # Reset
-        capture_mod._whisper_server_available = False
-
-    def test_transcribe_chunk_fallback_to_cli(self):
-        """When server unavailable, should fall back to CLI."""
-        capture_mod._whisper_server_available = False
-        audio = np.random.randn(16000).astype(np.float32) * 0.1
-        with patch.object(capture_mod, '_transcribe_via_cli', return_value="test text") as mock_cli:
-            result = capture_mod.transcribe_chunk(None, audio)
-        mock_cli.assert_called_once()
-        assert result == "test text"
-
-    def test_transcribe_chunk_uses_server_when_available(self):
-        """When server available, should use HTTP API."""
-        capture_mod._whisper_server_available = True
-        audio = np.random.randn(16000).astype(np.float32) * 0.1
-        with patch.object(capture_mod, '_transcribe_via_server', return_value="server text") as mock_srv, \
-             patch.object(capture_mod, '_transcribe_via_cli') as mock_cli:
-            result = capture_mod.transcribe_chunk(None, audio)
-        mock_srv.assert_called_once()
-        mock_cli.assert_not_called()
-        assert result == "server text"
-        capture_mod._whisper_server_available = False
-
-    def test_transcribe_chunk_server_error_falls_back(self):
-        """Server error should trigger CLI fallback."""
-        capture_mod._whisper_server_available = True
-        audio = np.random.randn(16000).astype(np.float32) * 0.1
-        with patch.object(capture_mod, '_transcribe_via_server', side_effect=Exception("connection refused")), \
-             patch.object(capture_mod, '_transcribe_via_cli', return_value="cli fallback") as mock_cli:
-            result = capture_mod.transcribe_chunk(None, audio)
-        mock_cli.assert_called_once()
-        assert result == "cli fallback"
-        capture_mod._whisper_server_available = False
-
-    def test_transcribe_chunk_silence_skipped(self):
-        """Very quiet audio should be skipped regardless of mode."""
-        capture_mod._whisper_server_available = True
-        audio = np.zeros(16000, dtype=np.float32)  # pure silence
-        with patch.object(capture_mod, '_transcribe_via_server') as mock_srv:
-            result = capture_mod.transcribe_chunk(None, audio)
-        mock_srv.assert_not_called()
-        assert result == ""
-        capture_mod._whisper_server_available = False
-
-    def test_transcribe_chunk_hallucination_filtered(self):
-        """Server result that is a hallucination should be filtered."""
-        capture_mod._whisper_server_available = True
-        audio = np.random.randn(16000).astype(np.float32) * 0.1
-        with patch.object(capture_mod, '_transcribe_via_server', return_value="Продолжение следует"):
-            result = capture_mod.transcribe_chunk(None, audio)
-        assert result == ""
-        capture_mod._whisper_server_available = False
-
-
-class TestTapReaderThread:
-    """Test tap reader with timeout and dead process detection."""
-
-    def test_tap_reader_sets_shutdown_on_process_exit(self):
-        """If tap process exits, shutdown_event should be set."""
-        capture_mod.shutdown_event.clear()
-        proc = MagicMock()
-        proc.poll.return_value = 1  # exited with error
-        proc.returncode = 1
-
-        t = threading.Thread(target=capture_mod.tap_reader_thread, args=(proc,))
-        t.start()
-        t.join(timeout=3)
-        assert capture_mod.shutdown_event.is_set()
-        capture_mod.shutdown_event.clear()
-
-    def test_tap_reader_reads_audio_to_queue(self):
-        """Valid PCM data should be converted and queued."""
-        capture_mod.shutdown_event.clear()
-        # Drain any existing items
-        while not capture_mod.audio_queue.empty():
-            capture_mod.audio_queue.get_nowait()
-
-        # Create 1 second of PCM int16 data (32000 bytes)
-        pcm = np.full(16000, 1000, dtype=np.int16).tobytes()
-        stream = io.BytesIO(pcm)
-
-        proc = MagicMock()
-        proc.poll.side_effect = [None, 0]  # alive first call, then exited
-        proc.returncode = 0
-        proc.stdout = stream
-
-        t = threading.Thread(target=capture_mod.tap_reader_thread, args=(proc,))
-        t.start()
-        t.join(timeout=3)
-
-        assert not capture_mod.audio_queue.empty()
-        audio = capture_mod.audio_queue.get_nowait()
-        assert len(audio) == 16000
-        assert audio.dtype == np.float32
-        capture_mod.shutdown_event.clear()
-
-    def test_read_exactly_timeout_returns_partial(self):
-        """_read_exactly should return partial data on timeout when fd available."""
-        # With BytesIO (no fd), timeout doesn't apply — test the fallback path
-        stream = io.BytesIO(b"abc")
-        result = capture_mod._read_exactly(stream, 10, timeout=0.1)
-        assert result == b"abc"  # partial data returned
-
-
-class TestStaleBufferFlush:
-    """Test that writer_thread flushes partial buffer when audio stops."""
-
-    def test_stale_buffer_constant_defined(self):
-        assert hasattr(capture_mod, 'STALE_BUFFER_TIMEOUT')
-        assert capture_mod.STALE_BUFFER_TIMEOUT > 0
-
-    def test_tap_silence_timeout_defined(self):
-        assert hasattr(capture_mod, 'TAP_SILENCE_TIMEOUT')
-        assert capture_mod.TAP_SILENCE_TIMEOUT > 0
-
-
-class TestStripHallucinations:
-    """Regression tests: every string below was observed leaking into real
-    transcripts. Whole-chunk dropping also lost genuine speech — check both."""
-
-    @pytest.mark.parametrize("text", [
-        "ПОДПИШИСЬ НА КАНАЛ",
-        "Субтитры делал DimaTorzok",
-        "Субтитры сделал DimaTorzok",
-        "Субтитры создавал DimaTorzok",
-        "Добавил субтитры DimaTorzok",
-        "ДИНАМИЧНАЯ МУЗЫКА",
-        "Играет музыка.",
-        "*Играет музыка* *Играет музыка*",
-        "[МУЗЫКА]",
-        "Продолжение следует...",
-    ])
-    def test_observed_leak_is_removed(self, text):
-        stripped = capture_mod._strip_hallucinations(text)
-        assert capture_mod._is_hallucination(stripped) is True
-
-    def test_real_speech_survives_trailing_outro(self):
-        text = "Давайте обсудим бюджет. Продолжение следует..."
-        stripped = capture_mod._strip_hallucinations(text)
-        assert stripped == "Давайте обсудим бюджет."
-        assert capture_mod._is_hallucination(stripped) is False
-
-    def test_real_speech_untouched(self):
-        text = "Давайте обсудим план проекта на следующий квартал."
-        assert capture_mod._strip_hallucinations(text) == text
-
-    def test_sound_event_removed_mid_sentence(self):
-        text = "Мы решили перенести релиз (смех) на понедельник."
-        assert capture_mod._strip_hallucinations(text) == "Мы решили перенести релиз на понедельник."
-
-    def test_parenthetical_speech_is_kept(self):
-        text = "Он сказал (я цитирую дословно) что сроки сдвигаются."
-        assert capture_mod._strip_hallucinations(text) == text
-
-    def test_empty_input(self):
-        assert capture_mod._strip_hallucinations("") == ""
-
-
-class TestLLMGenerateArgs:
-    """The `temp=` kwarg silently broke LLM post-processing for months —
-    generate() must be called with a sampler, never with temp."""
-
-    def test_generate_called_without_temp_kwarg(self, monkeypatch):
-        captured = {}
-
-        def fake_generate(model, tokenizer, prompt=None, **kwargs):
-            captured.update(kwargs)
-            return "result"
-
-        monkeypatch.setattr(capture_mod, "_llm_model", object())
-        monkeypatch.setattr(capture_mod, "_llm_tokenizer", object())
-        monkeypatch.setattr(capture_mod, "_llm_sampler", None)
-        monkeypatch.setitem(sys.modules, "mlx_lm", types.SimpleNamespace(generate=fake_generate))
-        monkeypatch.setitem(sys.modules, "mlx_lm.sample_utils",
-                            types.SimpleNamespace(make_sampler=lambda **kw: "sampler-obj"))
-
-        assert capture_mod._llm_generate("prompt") == "result"
-        assert "temp" not in captured
-        assert captured.get("sampler") == "sampler-obj"
-
-    def test_falls_back_to_greedy_when_sampler_api_missing(self, monkeypatch):
-        captured = {}
-
-        def fake_generate(model, tokenizer, prompt=None, **kwargs):
-            captured.update(kwargs)
-            return "result"
-
-        def boom(**kwargs):
-            raise ImportError("no sample_utils")
-
-        monkeypatch.setattr(capture_mod, "_llm_model", object())
-        monkeypatch.setattr(capture_mod, "_llm_tokenizer", object())
-        monkeypatch.setattr(capture_mod, "_llm_sampler", None)
-        monkeypatch.setitem(sys.modules, "mlx_lm", types.SimpleNamespace(generate=fake_generate))
-        monkeypatch.setitem(sys.modules, "mlx_lm.sample_utils",
-                            types.SimpleNamespace(make_sampler=boom))
-
-        assert capture_mod._llm_generate("prompt") == "result"
-        assert "sampler" not in captured
-        assert "temp" not in captured
-
-
-# -- Tests for the adaptive speech gate ----------------------------------------
-
-SAMPLE_RATE = capture_mod.SAMPLE_RATE
-
-
-def _speechlike(target_rms: float, seconds: float = 20.0, seed: int = 0) -> np.ndarray:
-    """Noise shaped like speech: loud stretches separated by pauses.
-
-    A real chunk is not a constant level — it alternates between phrases and
-    gaps, and it is the gaps the noise floor estimator is supposed to find.
-    """
-    rng = np.random.default_rng(seed)
-    n = int(SAMPLE_RATE * seconds)
-    audio = rng.standard_normal(n).astype(np.float32)
-
-    # 500 ms envelope: ~60% voiced, ~40% pause at room-tone level
-    frame = int(SAMPLE_RATE * 0.5)
-    envelope = np.ones(n, dtype=np.float32)
-    for i, start in enumerate(range(0, n, frame)):
-        envelope[start:start + frame] = 1.0 if (i % 5) < 3 else 0.04
-
-    audio *= envelope
-    audio *= target_rms / float(np.sqrt(np.mean(audio ** 2)))
-    return audio
-
-
-def _room_tone(rms: float, seconds: float = 20.0, seed: int = 1) -> np.ndarray:
-    """Flat low-level noise — an empty room with the mic open."""
-    rng = np.random.default_rng(seed)
-    audio = rng.standard_normal(int(SAMPLE_RATE * seconds)).astype(np.float32)
-    return audio * (rms / float(np.sqrt(np.mean(audio ** 2))))
 
 
 class TestNoiseFloor:

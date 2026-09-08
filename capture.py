@@ -90,73 +90,97 @@ def get_remote_participants() -> list[str]:
     return all_p
 
 
-# -- Speaker diarization -----------------------------------------------------
-
 _detected_language = None
 
-# -- Diarization calibration --------------------------------------------------
 
-_calibrated_silence = 0.005  # default, updated by calibration
-_calibrated_ratio = 2.5      # default, updated by calibration
-_calibration_done = False
-_calibration_bh_samples: list[np.ndarray] = []
-_calibration_mic_samples: list[np.ndarray] = []
-CALIBRATION_SECONDS = 5
+# -- Speaker diarization -------------------------------------------------------
+#
+# Comparing raw channel energies cannot work. The tap carries whatever Zoom
+# renders — scaled by system volume and by how loud the far end happens to be —
+# while the mic carries input gain and mouth distance. The two have no common
+# zero, so a fixed ratio threshold means one thing on headphones at 30% volume
+# and something else on speakers at 80%. Turning the volume knob mid-call used
+# to move every label in the transcript.
+#
+# Measure each channel against *its own* noise floor instead. "How many times
+# above its own floor is this channel right now" is dimensionless, which makes
+# the two sides comparable no matter how either is amplified.
+
+SPEAKER_ACTIVE_MULT = 3.0   # a channel counts as speaking at 3x its own floor
+SPEAKER_LEAD_RATIO = 2.5    # one side must lead the other by this much to own the frame
+BLEED_CORRELATION = 0.5     # above this the mic frame is the tap coming back
+ABS_FLOOR = 1e-5            # keeps a muted (all-zero) channel from dividing by ~0
 
 
-def _calibrate_thresholds(audio_bh: np.ndarray, audio_mic: np.ndarray):
-    """Calibrate silence threshold and speaker ratio from noise floor measurement."""
-    global _calibrated_silence, _calibrated_ratio, _calibration_done
-
-    # Measure RMS noise floor (95th percentile of frame energies)
-    frame_size = int(SAMPLE_RATE * 0.5)  # 500ms frames
-    bh_energies = []
-    mic_energies = []
-    for i in range(0, min(len(audio_bh), len(audio_mic)), frame_size):
-        bh_energies.append(np.sqrt(np.mean(audio_bh[i:i + frame_size] ** 2)))
-        mic_energies.append(np.sqrt(np.mean(audio_mic[i:i + frame_size] ** 2)))
-
-    if not bh_energies:
-        _calibration_done = True
-        return
-
-    bh_floor = float(np.percentile(bh_energies, 95))
-    mic_floor = float(np.percentile(mic_energies, 95))
-    noise_floor = max(bh_floor, mic_floor)
-
-    # Silence threshold: 1.5x noise floor, clamped to reasonable range
-    _calibrated_silence = max(0.002, min(0.05, noise_floor * 1.5))
-
-    # Ratio threshold: based on bleed ratio, clamped 1.5–5.0
-    if bh_floor > 1e-6:
-        bleed_ratio = mic_floor / bh_floor
-        _calibrated_ratio = max(1.5, min(5.0, bleed_ratio * 2.0))
-
-    _calibration_done = True
-    print(f"[meeting] Diarization calibrated: silence={_calibrated_silence:.4f}, ratio={_calibrated_ratio:.1f} "
-          f"(noise floor: bh={bh_floor:.4f}, mic={mic_floor:.4f})", flush=True)
+def _frame_correlation(a: np.ndarray, b: np.ndarray) -> float:
+    """Normalised correlation of two frames. 0 when either is flat or degenerate."""
+    if a.size == 0 or b.size == 0 or a.size != b.size:
+        return 0.0
+    a = a - a.mean()
+    b = b - b.mean()
+    na = float(np.sqrt(np.dot(a, a)))
+    nb = float(np.sqrt(np.dot(b, b)))
+    if not np.isfinite(na) or not np.isfinite(nb) or na < 1e-12 or nb < 1e-12:
+        return 0.0
+    corr = float(np.dot(a, b)) / (na * nb)
+    return abs(corr) if np.isfinite(corr) else 0.0
 
 
 def _classify_speakers(audio_bh: np.ndarray, audio_mic: np.ndarray,
-                       frame_ms: int = 500) -> list[tuple[str, int, int]]:
-    """Classify [You] vs [Remote] using energy ratio between the two channels."""
-    frame_size = int(SAMPLE_RATE * frame_ms / 1000)
-    segments = []
-    silence_threshold = _calibrated_silence
-    ratio_threshold = _calibrated_ratio
+                       frame_ms: int = 500,
+                       bh_floor: float | None = None,
+                       mic_floor: float | None = None) -> list[tuple[str, int, int]]:
+    """Label each frame [You], [Remote] or [Both] by lift over each channel's floor.
 
+    Floors come from the rolling estimate when the caller has one; otherwise
+    they are taken from the chunk itself, which is enough for a 10–20s window.
+    """
+    frame_size = int(SAMPLE_RATE * frame_ms / 1000)
+    if frame_size <= 0:
+        return []
+
+    if bh_floor is None:
+        bh_floor = _estimate_floor(audio_bh, frame_ms)
+    if mic_floor is None:
+        mic_floor = _estimate_floor(audio_mic, frame_ms)
+    bh_floor = max(bh_floor, ABS_FLOOR)
+    mic_floor = max(mic_floor, ABS_FLOOR)
+
+    segments = []
     for i in range(0, min(len(audio_bh), len(audio_mic)), frame_size):
         bh_frame = audio_bh[i:i + frame_size]
         mic_frame = audio_mic[i:i + frame_size]
+        energy_bh = float(np.sqrt(np.mean(bh_frame ** 2)))
+        energy_mic = float(np.sqrt(np.mean(mic_frame ** 2)))
+        if not (np.isfinite(energy_bh) and np.isfinite(energy_mic)):
+            continue  # corrupt frame — no opinion is better than a wrong label
 
-        energy_bh = np.sqrt(np.mean(bh_frame ** 2))
-        energy_mic = np.sqrt(np.mean(mic_frame ** 2))
+        lift_bh = energy_bh / bh_floor
+        lift_mic = energy_mic / mic_floor
+        bh_on = lift_bh >= SPEAKER_ACTIVE_MULT
+        mic_on = lift_mic >= SPEAKER_ACTIVE_MULT
 
-        if energy_bh < silence_threshold and energy_mic < silence_threshold:
+        if not bh_on and not mic_on:
             continue
-
-        ratio = energy_mic / (energy_bh + 1e-8)
-        speaker = "[You]" if ratio > ratio_threshold else "[Remote]"
+        if bh_on and not mic_on:
+            speaker = "[Remote]"
+        elif mic_on and not bh_on:
+            speaker = "[You]"
+        elif lift_mic >= lift_bh * SPEAKER_LEAD_RATIO:
+            # Both lit but the mic leads by a wide margin: you are talking and
+            # the far end is only bleeding back through the room.
+            speaker = "[You]"
+        elif lift_bh >= lift_mic * SPEAKER_LEAD_RATIO:
+            speaker = "[Remote]"
+        elif _frame_correlation(bh_frame, mic_frame) >= BLEED_CORRELATION:
+            # Neither side leads on level. Heavy speaker bleed and genuine
+            # simultaneous speech look identical that way, but not in shape:
+            # bleed is a scaled copy of the tap, so it correlates with it,
+            # while two people talking at once do not. (Room delay and
+            # colouring lower the correlation, hence the loose threshold.)
+            speaker = "[Remote]"
+        else:
+            speaker = "[Both]"
         segments.append((speaker, i, i + frame_size))
 
     if not segments:
@@ -180,26 +204,34 @@ def _remote_label() -> str:
 
 def _build_diarized_text(text: str, segments: list[tuple[str, int, int]],
                          audio_len: int) -> str:
+    """Pick one label for the chunk from its frame-level segments."""
     if not segments:
         return text
-    speaker_time = {}
+
+    # A [Both] frame counts toward each side — it is time both of them held.
+    you_time = 0
+    remote_time = 0
     for speaker, start, end in segments:
-        speaker_time[speaker] = speaker_time.get(speaker, 0) + (end - start)
-    dominant = max(speaker_time, key=speaker_time.get)
-    if len(speaker_time) > 1:
-        total = sum(speaker_time.values())
-        you_pct = speaker_time.get("[You]", 0) / total
-        if you_pct > 0.7:
-            return f"[You] {text}"
-        elif you_pct < 0.3:
-            remote = _remote_label()
-            return f"{remote} {text}"
+        span = end - start
+        if speaker == "[You]":
+            you_time += span
+        elif speaker == "[Both]":
+            you_time += span
+            remote_time += span
         else:
-            remote = _remote_label()
-            return f"[You + {remote.strip('[]')}] {text}"
-    if dominant == "[Remote]":
-        dominant = _remote_label()
-    return f"{dominant} {text}"
+            remote_time += span
+
+    total = you_time + remote_time
+    if total <= 0:
+        return text
+
+    you_share = you_time / total
+    remote = _remote_label()
+    if you_share > 0.7:
+        return f"[You] {text}"
+    if you_share < 0.3:
+        return f"{remote} {text}"
+    return f"[You + {remote.strip('[]')}] {text}"
 
 
 # -- Transcription (whisper.cpp with Metal GPU) --------------------------------
@@ -345,6 +377,23 @@ class NoiseFloor:
     def reset(self):
         with self._lock:
             self._energies.clear()
+
+
+def _estimate_floor(audio: np.ndarray, frame_ms: int = NOISE_FRAME_MS) -> float:
+    """Noise floor of a single chunk, for callers with no rolling history."""
+    if audio is None or audio.size == 0:
+        return 0.0
+    frame_size = int(SAMPLE_RATE * frame_ms / 1000)
+    energies = []
+    if frame_size > 0:
+        for i in range(0, len(audio) - frame_size + 1, frame_size):
+            energies.append(float(np.sqrt(np.mean(audio[i:i + frame_size] ** 2))))
+    if not energies:
+        energies = [float(np.sqrt(np.mean(audio ** 2)))]
+    energies = [e for e in energies if np.isfinite(e)]
+    if not energies:
+        return 0.0
+    return float(np.percentile(energies, NOISE_PERCENTILE))
 
 
 _mix_noise = NoiseFloor()   # gates what reaches Whisper
@@ -683,15 +732,11 @@ STALE_BUFFER_TIMEOUT = 5  # flush partial buffer if no new audio for this many s
 
 
 def writer_thread(model, has_mic: bool):
-    global _calibration_done
     buffer_bh = []
     buffer_mic = []
     chunk_start = datetime.now()
     last_heartbeat = time.monotonic()
     last_audio_received = time.monotonic()
-    calibration_samples_bh = []
-    calibration_samples_mic = []
-    calibration_total = 0
 
     print(f"[meeting] Recording... transcript -> {TRANSCRIPT_FILE}", flush=True)
 
@@ -709,22 +754,6 @@ def writer_thread(model, has_mic: bool):
 
             if has_mic:
                 buffer_mic.extend(_drain_queue(mic_queue))
-
-            # Diarization calibration: collect first N seconds of audio
-            if has_mic and not _calibration_done and bh_chunks:
-                for chunk in bh_chunks:
-                    calibration_samples_bh.append(chunk.flatten())
-                    calibration_total += chunk.size
-                mic_chunks = _drain_queue(mic_queue)
-                for chunk in mic_chunks:
-                    calibration_samples_mic.append(chunk.flatten())
-                buffer_mic.extend(mic_chunks)
-                if calibration_total >= SAMPLE_RATE * CALIBRATION_SECONDS:
-                    cal_bh = np.concatenate(calibration_samples_bh)
-                    cal_mic = np.concatenate(calibration_samples_mic) if calibration_samples_mic else np.zeros_like(cal_bh)
-                    _calibrate_thresholds(cal_bh, cal_mic)
-                    calibration_samples_bh.clear()
-                    calibration_samples_mic.clear()
 
             total_bh = sum(d.size for d in buffer_bh)
 
@@ -751,6 +780,13 @@ def writer_thread(model, has_mic: bool):
                 else:
                     audio_mixed = audio_bh
                     buffer_mic = []
+
+                # Feed the per-channel floors from every chunk, silence
+                # included — the quiet stretches are what the estimate needs.
+                if audio_mic_raw is not None:
+                    _bh_noise.observe(audio_bh_padded)
+                    _mic_noise.observe(audio_mic_padded)
+
                 chunk_end = datetime.now()
 
                 rms = np.sqrt(np.mean(audio_mixed ** 2))
@@ -761,7 +797,10 @@ def writer_thread(model, has_mic: bool):
                 if text:
                     if ENABLE_DIARIZATION and audio_mic_raw is not None:
                         try:
-                            segments = _classify_speakers(audio_bh_padded, audio_mic_padded)
+                            segments = _classify_speakers(
+                                audio_bh_padded, audio_mic_padded,
+                                bh_floor=_bh_noise.level or None,
+                                mic_floor=_mic_noise.level or None)
                             text = _build_diarized_text(text, segments, len(audio_bh_padded))
                         except Exception:
                             pass
@@ -801,7 +840,10 @@ def writer_thread(model, has_mic: bool):
             if text:
                 if ENABLE_DIARIZATION and flush_mic_padded is not None:
                     try:
-                        segments = _classify_speakers(flush_bh_padded, flush_mic_padded)
+                        segments = _classify_speakers(
+                            flush_bh_padded, flush_mic_padded,
+                            bh_floor=_bh_noise.level or None,
+                            mic_floor=_mic_noise.level or None)
                         text = _build_diarized_text(text, segments, len(flush_bh_padded))
                     except Exception:
                         pass
