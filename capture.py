@@ -31,7 +31,6 @@ CHUNK_SECONDS = 10
 MAX_QUEUE_CHUNKS = 240  # ~4 min of audio in queue items
 _DEFAULT_TRANSCRIPT = Path(__file__).parent / "transcripts" / "meeting_transcript.txt"
 TRANSCRIPT_FILE = Path(os.environ.get("TRANSCRIPT_FILE", _DEFAULT_TRANSCRIPT))
-MODEL_SIZE = os.environ.get("WHISPER_MODEL", "small")
 ENABLE_DIARIZATION = os.environ.get("DIARIZATION", "1") == "1"
 LANGUAGE = os.environ.get("LANGUAGE", "ru")  # forced language, "auto" for auto-detect
 CAPTURE_MODE = os.environ.get("CAPTURE_MODE", "coreaudio")  # "coreaudio" or "legacy"
@@ -241,8 +240,24 @@ def _build_diarized_text(text: str, segments: list[tuple[str, int, int]],
 
 WHISPER_CLI = os.environ.get("WHISPER_CLI", "whisper-cli")
 WHISPER_SERVER_BIN = os.environ.get("WHISPER_SERVER", "whisper-server")
-WHISPER_MODEL_PATH = os.environ.get("WHISPER_MODEL_PATH",
-    str(Path(__file__).parent / "models" / "ggml-large-v3-turbo.bin"))
+MODELS_DIR = Path(__file__).parent / "models"
+WHISPER_MODEL = os.environ.get("WHISPER_MODEL", "large-v3-turbo")
+
+
+def resolve_model_path(name: str | None = None) -> Path:
+    """File for a whisper.cpp model name. An explicit path always wins.
+
+    The menu bar writes a model name into config.json and the watcher passes it
+    through as WHISPER_MODEL. That name used to land in a variable nothing read,
+    so the selector moved a label and changed no behaviour at all.
+    """
+    override = os.environ.get("WHISPER_MODEL_PATH")
+    if override:
+        return Path(override)
+    return MODELS_DIR / f"ggml-{name or WHISPER_MODEL}.bin"
+
+
+WHISPER_MODEL_PATH = str(resolve_model_path())
 WHISPER_SERVER_HOST = os.environ.get("WHISPER_SERVER_HOST", "127.0.0.1")
 WHISPER_SERVER_PORT = int(os.environ.get("WHISPER_SERVER_PORT", "8178"))
 _whisper_server_available = False  # set True after successful health check
@@ -1238,11 +1253,15 @@ def main():
             sys.exit(1)
 
         if not Path(WHISPER_MODEL_PATH).exists():
+            model_file = Path(WHISPER_MODEL_PATH).name
             print(f"[meeting] ERROR: Model not found: {WHISPER_MODEL_PATH}", file=sys.stderr)
-            print(f"[meeting] Download: curl -L -o {WHISPER_MODEL_PATH} https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3-turbo.bin", file=sys.stderr)
+            print(f"[meeting] Download: curl -L -o {WHISPER_MODEL_PATH} "
+                  f"https://huggingface.co/ggerganov/whisper.cpp/resolve/main/{model_file}",
+                  file=sys.stderr)
             sys.exit(1)
 
-    print(f"[meeting] Model: {Path(WHISPER_MODEL_PATH).name}, Language: {LANGUAGE}", flush=True)
+    print(f"[meeting] Model: {WHISPER_MODEL} ({Path(WHISPER_MODEL_PATH).name}), "
+          f"Language: {LANGUAGE}", flush=True)
 
     def handle_signal(sig, frame):
         shutdown_event.set()

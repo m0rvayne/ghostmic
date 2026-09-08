@@ -1123,3 +1123,29 @@ class TestLLMPostDisabledByDefault:
             if saved is not None:
                 os.environ["LLM_POST"] = saved
             importlib.reload(capture_mod)
+
+
+class TestModelResolution:
+    """The menu-bar model name must reach the model file.
+
+    It used to land in MODEL_SIZE, which nothing read — the selector offered
+    five names, none of them the model the installer downloads, and picking one
+    changed nothing.
+    """
+
+    def test_name_becomes_a_ggml_file(self, monkeypatch):
+        monkeypatch.delenv("WHISPER_MODEL_PATH", raising=False)
+        assert capture_mod.resolve_model_path("medium").name == "ggml-medium.bin"
+
+    def test_lands_in_the_models_dir(self, monkeypatch):
+        monkeypatch.delenv("WHISPER_MODEL_PATH", raising=False)
+        assert capture_mod.resolve_model_path("small").parent == capture_mod.MODELS_DIR
+
+    def test_explicit_path_wins(self, monkeypatch):
+        monkeypatch.setenv("WHISPER_MODEL_PATH", "/tmp/custom.bin")
+        assert str(capture_mod.resolve_model_path("medium")) == "/tmp/custom.bin"
+
+    def test_defaults_to_the_configured_model(self, monkeypatch):
+        monkeypatch.delenv("WHISPER_MODEL_PATH", raising=False)
+        expected = f"ggml-{capture_mod.WHISPER_MODEL}.bin"
+        assert capture_mod.resolve_model_path().name == expected

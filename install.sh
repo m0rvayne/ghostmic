@@ -130,6 +130,15 @@ else
     say "Warning: participant detection not compiled (speaker names unavailable)"
 fi
 
+# ── 5b. Record what was installed ────────────────────────────────────────────
+# Without this there is no way to tell a running install from the repo it came
+# from — a deploy can sit months behind the source with nothing to show it.
+BUILD_COMMIT="$(cd "$SCRIPT_DIR" && git rev-parse --short HEAD 2>/dev/null || echo unknown)"
+cat > "$INSTALL_DIR/build-info.json" <<BUILDEOF
+{"commit": "$BUILD_COMMIT", "installed_at": "$(date -u +%Y-%m-%dT%H:%M:%SZ)"}
+BUILDEOF
+ok "Build recorded: $BUILD_COMMIT"
+
 # ── 6. Python venv + deps ───────────────────────────────────────────────────
 say "Installing Python dependencies..."
 $PYTHON -m venv "$INSTALL_DIR/.venv"

@@ -533,3 +533,86 @@ class TestDiscardEmptyTranscripts:
 
         assert not transcript.exists()
         assert ctx.state == watcher.State.IDLE
+
+
+class TestWhisperSettings:
+    """Model and language reach whisper-server, and changing them restarts it."""
+
+    def test_model_name_from_user_config(self, tmp_path):
+        cfg = watcher.default_config()
+        path, lang = watcher.whisper_settings(cfg, {"whisper_model": "medium",
+                                                    "language": "en"})
+        assert path.endswith("models/ggml-medium.bin")
+        assert lang == "en"
+
+    def test_falls_back_to_the_shipped_model(self):
+        cfg = watcher.default_config()
+        path, _ = watcher.whisper_settings(cfg, {})
+        assert path.endswith(f"ggml-{watcher.DEFAULT_WHISPER_MODEL}.bin")
+
+    def test_explicit_path_env_wins(self, monkeypatch):
+        monkeypatch.setenv("WHISPER_MODEL_PATH", "/tmp/pinned.bin")
+        path, _ = watcher.whisper_settings(watcher.default_config(),
+                                           {"whisper_model": "medium"})
+        assert path == "/tmp/pinned.bin"
+
+    def test_missing_model_file_does_not_start_the_server(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("WHISPER_MODEL_PATH", str(tmp_path / "absent.bin"))
+        ctx = watcher.WatcherContext(config=watcher.default_config())
+        with patch.object(watcher, "_whisper_server_healthy", return_value=False), \
+             patch.object(watcher.subprocess, "Popen") as popen:
+            watcher.start_whisper_server(ctx)
+        popen.assert_not_called()
+
+
+class TestWhisperIdleRelease:
+    """~1.6 GB of model should not stay resident until logout."""
+
+    def _ctx(self):
+        ctx = watcher.WatcherContext(config=watcher.default_config())
+        ctx.whisper_server_process = MagicMock(poll=MagicMock(return_value=None))
+        ctx.state = watcher.State.IDLE
+        return ctx
+
+    def test_idle_clock_starts_when_nothing_is_recording(self):
+        ctx = self._ctx()
+        watcher._release_whisper_when_idle(ctx)
+        assert ctx.whisper_idle_since is not None
+
+    def test_server_released_after_the_timeout(self):
+        ctx = self._ctx()
+        ctx.whisper_idle_since = time.monotonic() - watcher.WHISPER_IDLE_TIMEOUT - 1
+        with patch.object(watcher, "stop_whisper_server") as stop:
+            watcher._release_whisper_when_idle(ctx)
+        stop.assert_called_once()
+
+    def test_server_kept_while_recording(self):
+        ctx = self._ctx()
+        ctx.state = watcher.State.RECORDING
+        ctx.whisper_idle_since = time.monotonic() - watcher.WHISPER_IDLE_TIMEOUT - 1
+        with patch.object(watcher, "stop_whisper_server") as stop:
+            watcher._release_whisper_when_idle(ctx)
+        stop.assert_not_called()
+        assert ctx.whisper_idle_since is None
+
+    def test_nothing_to_release(self):
+        ctx = watcher.WatcherContext(config=watcher.default_config())
+        watcher._release_whisper_when_idle(ctx)
+        assert ctx.whisper_idle_since is None
+
+
+class TestBuildStamp:
+    """A deploy sitting months behind its source should say so in the log."""
+
+    def test_reads_recorded_build(self, tmp_path):
+        (tmp_path / "build-info.json").write_text(
+            '{"commit": "abc1234", "installed_at": "2026-09-08T09:00:00Z"}')
+        stamp = watcher.build_stamp(tmp_path)
+        assert "abc1234" in stamp and "2026-09-08" in stamp
+
+    def test_says_unknown_when_never_recorded(self, tmp_path):
+        assert "unknown" in watcher.build_stamp(tmp_path)
+
+    def test_malformed_file_does_not_raise(self, tmp_path):
+        (tmp_path / "build-info.json").write_text("{not json")
+        assert "unknown" in watcher.build_stamp(tmp_path)

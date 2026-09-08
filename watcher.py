@@ -48,6 +48,15 @@ class WatcherConfig:
     log_backup_count: int = 3
 
 
+def build_stamp(install_dir: Path) -> str:
+    """What is installed, for the log — a stale deploy is otherwise invisible."""
+    try:
+        data = json.loads((install_dir / "build-info.json").read_text())
+        return f"build {data.get('commit', '?')} installed {data.get('installed_at', '?')}"
+    except Exception:
+        return "build unknown (installed before build stamping — run update.sh)"
+
+
 def _load_user_config(install_dir: Path) -> dict:
     """Load user config from config.json (written by menu bar settings)."""
     config_file = install_dir / "config.json"
@@ -102,6 +111,8 @@ class WatcherContext:
     backoff_until: Optional[float] = None
     running: bool = True
     whisper_server_process: Optional[subprocess.Popen] = None
+    whisper_settings: Optional[tuple] = None
+    whisper_idle_since: Optional[float] = None
     _whisper_log_file: Optional[object] = None
 
 
@@ -266,6 +277,24 @@ def update_symlink(config: WatcherConfig, target: Path):
 
 WHISPER_SERVER_PORT = 8178
 
+# The server keeps ~1.6 GB of model resident. It used to be started on the
+# first meeting and released only at logout, which is a lot to hold for a
+# background utility on a 16 GB machine.
+WHISPER_IDLE_TIMEOUT = 600.0
+
+DEFAULT_WHISPER_MODEL = "large-v3-turbo"
+
+
+def whisper_settings(config: WatcherConfig, user_cfg: dict) -> tuple[str, str]:
+    """(model path, language) the server should be running with."""
+    name = (user_cfg.get("whisper_model")
+            or os.environ.get("WHISPER_MODEL")
+            or DEFAULT_WHISPER_MODEL)
+    path = (os.environ.get("WHISPER_MODEL_PATH")
+            or str(config.install_dir / "models" / f"ggml-{name}.bin"))
+    language = user_cfg.get("language", os.environ.get("LANGUAGE", "ru"))
+    return path, language
+
 
 def _whisper_server_healthy() -> bool:
     """Check if whisper-server is responding."""
@@ -280,9 +309,25 @@ def _whisper_server_healthy() -> bool:
 
 
 def start_whisper_server(ctx: WatcherContext):
-    """Start whisper-server if not already running. Model stays in memory."""
+    """Start whisper-server if needed. Model stays in memory between meetings."""
+    user_cfg = _load_user_config(ctx.config.install_dir)
+    model_path, language = whisper_settings(ctx.config, user_cfg)
+    wanted = (model_path, language)
+
     if _whisper_server_healthy():
-        logger.info("whisper-server already running")
+        if ctx.whisper_server_process is None:
+            logger.info("whisper-server already running (started elsewhere) — leaving it alone")
+            return
+        if ctx.whisper_settings == wanted:
+            logger.info("whisper-server already running")
+            return
+        # Settings changed in the menu bar. The server took its model and
+        # language on the command line, so they only take effect on a restart.
+        logger.info(f"whisper-server settings changed {ctx.whisper_settings} -> {wanted} — restarting")
+        stop_whisper_server(ctx)
+
+    if not Path(model_path).exists():
+        logger.error(f"Whisper model not found: {model_path} — falling back to whisper-cli")
         return
 
     # Find whisper-server binary
@@ -295,10 +340,6 @@ def start_whisper_server(ctx: WatcherContext):
         return
 
     server_bin = r.stdout.strip()
-    user_cfg = _load_user_config(ctx.config.install_dir)
-    model_path = os.environ.get("WHISPER_MODEL_PATH",
-        str(ctx.config.install_dir / "models" / "ggml-large-v3-turbo.bin"))
-    language = user_cfg.get("language", os.environ.get("LANGUAGE", "ru"))
 
     cmd = [
         server_bin,
@@ -317,7 +358,9 @@ def start_whisper_server(ctx: WatcherContext):
     ctx.whisper_server_process = subprocess.Popen(
         cmd, stdout=ctx._whisper_log_file, stderr=ctx._whisper_log_file,
     )
-    logger.info(f"whisper-server started (PID {ctx.whisper_server_process.pid}, port {WHISPER_SERVER_PORT})")
+    ctx.whisper_settings = wanted
+    logger.info(f"whisper-server started (PID {ctx.whisper_server_process.pid}, "
+                f"port {WHISPER_SERVER_PORT}, model {Path(model_path).name}, lang {language})")
 
     # Wait for server to be ready (model loading takes a few seconds)
     for _ in range(30):  # up to 30s
@@ -342,6 +385,7 @@ def stop_whisper_server(ctx: WatcherContext):
             ctx.whisper_server_process.kill()
         logger.info("whisper-server stopped")
     ctx.whisper_server_process = None
+    ctx.whisper_settings = None
     if ctx._whisper_log_file:
         try:
             ctx._whisper_log_file.close()
@@ -384,6 +428,10 @@ def start_capture(ctx: WatcherContext):
 
     # Read user config for whisper model and diarization
     user_cfg = _load_user_config(config.install_dir)
+    # Pin the resolved path so capture.py and whisper-server cannot disagree
+    # about which model is in play.
+    resolved_model, _ = whisper_settings(config, user_cfg)
+    env["WHISPER_MODEL_PATH"] = resolved_model
     if user_cfg.get("whisper_model"):
         env["WHISPER_MODEL"] = user_cfg["whisper_model"]
     if user_cfg.get("diarization"):
@@ -416,6 +464,7 @@ def start_capture(ctx: WatcherContext):
 
     threading.Thread(target=stream_output, daemon=True).start()
     ctx.state = State.RECORDING
+    ctx.whisper_idle_since = None
     logger.info(f"Recording started -> {ctx.current_transcript.name}")
 
 
@@ -575,6 +624,25 @@ def tick(ctx: WatcherContext):
                 stop_capture(ctx)
                 ctx.grace_start = None
 
+    _release_whisper_when_idle(ctx)
+
+
+def _release_whisper_when_idle(ctx: WatcherContext):
+    """Give back the model's memory once meetings have stopped for a while."""
+    if ctx.whisper_server_process is None:
+        ctx.whisper_idle_since = None
+        return
+    if ctx.state not in (State.IDLE, State.BACKOFF):
+        ctx.whisper_idle_since = None
+        return
+    if ctx.whisper_idle_since is None:
+        ctx.whisper_idle_since = time.monotonic()
+        return
+    if time.monotonic() - ctx.whisper_idle_since >= WHISPER_IDLE_TIMEOUT:
+        logger.info(f"Idle for {WHISPER_IDLE_TIMEOUT / 60:.0f} min — releasing whisper-server")
+        stop_whisper_server(ctx)
+        ctx.whisper_idle_since = None
+
 
 def main():
     config = default_config()
@@ -601,7 +669,8 @@ def main():
     signal.signal(signal.SIGINT, handle_signal)
 
     write_status(config, "IDLE")
-    logger.info("Watcher started. Monitoring for Zoom meetings...")
+    logger.info(f"Watcher started [{build_stamp(config.install_dir)}]. "
+                f"Monitoring for Zoom meetings...")
 
     while ctx.running:
         tick(ctx)

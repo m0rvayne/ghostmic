@@ -1006,6 +1006,13 @@ async def call_tool(name: str, arguments: dict | None):
     elif name == "ghostmic_status":
         parts = []
 
+        try:
+            info = json.loads((INSTALL_DIR / "build-info.json").read_text())
+            parts.append(f"Build: {info.get('commit', '?')} "
+                         f"(installed {info.get('installed_at', '?')})")
+        except Exception:
+            parts.append("Build: unknown (run update.sh to record it)")
+
         if PID_FILE.exists():
             try:
                 pid = int(PID_FILE.read_text().strip())

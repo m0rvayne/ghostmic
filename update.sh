@@ -42,6 +42,12 @@ for f in "$SCRIPT_DIR"/*.py "$SCRIPT_DIR"/*.sh "$SCRIPT_DIR"/*.swift "$SCRIPT_DI
     fi
 done
 
+# Refresh the build stamp so watcher.log and ghostmic_status show what is running
+BUILD_COMMIT="$(cd "$SCRIPT_DIR" && git rev-parse --short HEAD 2>/dev/null || echo unknown)"
+cat > "$INSTALL_DIR/build-info.json" <<BUILDEOF
+{"commit": "$BUILD_COMMIT", "installed_at": "$(date -u +%Y-%m-%dT%H:%M:%SZ)"}
+BUILDEOF
+
 # Install any new pip dependencies
 "$INSTALL_DIR/.venv/bin/pip" install -q -r "$INSTALL_DIR/requirements.txt" 2>/dev/null
 

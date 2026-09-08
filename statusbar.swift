@@ -81,12 +81,28 @@ let kWidth: CGFloat = 280
 
 // MARK: - Config
 
+let kDefaultWhisperModel = "large-v3-turbo"
+
 struct AppConfig {
-    var whisperModel: String = "small"
+    var whisperModel: String = kDefaultWhisperModel
     var diarization: Bool = true
     var transcriptsPath: String
 
-    static let models = ["tiny", "base", "small", "medium", "large-v3"]
+    /// Models actually present on disk, as ggml-<name>.bin.
+    ///
+    /// This list used to be hardcoded to five names, none of which matched the
+    /// only file the installer downloads — so every option offered was a model
+    /// the machine did not have, and the selector changed nothing anyway.
+    static func availableModels(home: String) -> [String] {
+        let dir = home + "/.ghostmic/models"
+        let files = (try? FileManager.default.contentsOfDirectory(atPath: dir)) ?? []
+        var names = files.compactMap { name -> String? in
+            guard name.hasPrefix("ggml-"), name.hasSuffix(".bin") else { return nil }
+            return String(name.dropFirst(5).dropLast(4))
+        }.sorted()
+        if names.isEmpty { names = [kDefaultWhisperModel] }
+        return names
+    }
 
     static func load(home: String) -> AppConfig {
         let dir = home + "/.ghostmic"
@@ -94,7 +110,7 @@ struct AppConfig {
         var cfg = AppConfig(transcriptsPath: dir + "/transcripts")
         if let data = try? Data(contentsOf: URL(fileURLWithPath: dir + "/config.json")),
            let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
-            cfg.whisperModel = json["whisper_model"] as? String ?? "small"
+            cfg.whisperModel = json["whisper_model"] as? String ?? kDefaultWhisperModel
             cfg.diarization = (json["diarization"] as? String ?? "1") == "1"
             if let p = json["transcripts_path"] as? String, !p.isEmpty { cfg.transcriptsPath = p }
         }
@@ -400,7 +416,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         // --- Model selector: row of HoverButtons ---
         let modelItem = NSMenuItem()
         var modelBtns: [HoverButton] = []
-        for m in AppConfig.models {
+        for m in AppConfig.availableModels(home: homePath) {
             let isActive = (m == config.whisperModel)
             let btn = HoverButton()
             btn.title = m
