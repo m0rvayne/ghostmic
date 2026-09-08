@@ -60,24 +60,38 @@ whisper.cpp large-v3-turbo (Metal GPU, model resident via whisper-server)
 Rule-based cleanup (canned outros, sound annotations, repetition)
     |
     v
+LLM repair pass (only on words whisper was unsure of; guarded)
+    |
+    v
 Transcript file ──> server.py (MCP) ──> Claude Desktop / Claude Code
 ```
 
-### About the optional LLM pass
+### The LLM repair pass
 
-There is a Qwen3-0.6B post-processing stage behind `LLM_POST=1`. It is **off by
-default**, because it was measured and it did not earn its place.
+A Qwen3-0.6B stage runs after transcription. Turn it off with `LLM_POST=0`,
+pick a different model with `LLM_MODEL`.
 
-Over 40 real chunks (`tools/measure_llm_post.py`): 35% of the time the model
-produced unrelated dialogue continued from the surrounding context instead of a
-repair; 35% returned the text unchanged; most of the remaining edits silently
-dropped the last sentence of the chunk, and one introduced a typo into a word
-that had been correct. One edit in forty was a genuine fix.
+It is deliberately quiet. It is only called on chunks where whisper reported
+low confidence in a word — with nothing doubtful there is nothing to repair,
+and a model asked to improve a correct sentence tends to delete the last one.
+When it does run, the doubtful words are named in the prompt so it knows where
+to look, and its output has to get past a guard before it replaces anything:
 
-Silent truncation is the reason it stays off. A garbled sentence is visibly
-garbled and you can go listen again; a dropped one leaves nothing to notice.
-If you enable it anyway, output that changes the text too much, loses a number,
-or changes length too far is rejected and the transcribed text is kept.
+- a lost or altered number → rejected
+- length outside 0.92–1.15× the original → rejected (this is what catches
+  truncation, the most common failure)
+- normalised edit distance over 0.35 → rejected
+- a known hallucination phrase → rejected
+
+Every accepted edit is printed to `watcher.log` with the text before and after,
+so you can see what it is doing rather than trust that it is doing something.
+
+**Measured, so you know what you are getting.** `tools/measure_llm_post.py`
+runs the production prompt through the production model over real chunks from
+your own archive. On 60 chunks with Qwen3-0.6B: 38 untouched, 16 rejected by
+the guard, 6 changed — one real repair, two cosmetic, one mixed, and two that
+put case errors into correct Russian. A larger model in `LLM_MODEL` is the
+lever if that trade is not good enough; run the harness and compare.
 
 ## Install
 
@@ -148,7 +162,7 @@ take effect on the next chunk — no restart.
 - **macOS 14.4+.** Requires CoreAudio Process Taps API.
 - **~15 second latency.** Audio chunks processed every ~10 seconds + AI pipeline.
 - **Two-party speaker labels.** Cannot distinguish multiple remote speakers by voice.
-- **No LLM cleanup by default.** The transcript is what Whisper heard, filtered for known artefacts — readable, but not polished prose.
+- **The LLM pass is a repair, not a rewrite.** It fixes words whisper flagged as uncertain; it does not turn speech into polished prose.
 
 <details>
 <summary><strong>Troubleshooting</strong></summary>

@@ -1113,15 +1113,27 @@ class TestLLMOutputGuard:
         capture_mod._llm_rejections.clear()
 
 
-class TestLLMPostDisabledByDefault:
-    def test_off_unless_opted_in(self):
-        """Measured net-negative — it must not come back on by accident."""
+class TestLLMPostEnabledByDefault:
+    def test_on_unless_turned_off(self):
         import importlib, os
         saved = os.environ.pop("LLM_POST", None)
         try:
-            assert importlib.reload(capture_mod).ENABLE_LLM_POST is False
+            assert importlib.reload(capture_mod).ENABLE_LLM_POST is True
         finally:
             if saved is not None:
+                os.environ["LLM_POST"] = saved
+            importlib.reload(capture_mod)
+
+    def test_can_be_turned_off(self):
+        import importlib, os
+        saved = os.environ.get("LLM_POST")
+        os.environ["LLM_POST"] = "0"
+        try:
+            assert importlib.reload(capture_mod).ENABLE_LLM_POST is False
+        finally:
+            if saved is None:
+                os.environ.pop("LLM_POST", None)
+            else:
                 os.environ["LLM_POST"] = saved
             importlib.reload(capture_mod)
 

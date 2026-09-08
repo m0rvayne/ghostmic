@@ -39,10 +39,9 @@ BUNDLE_ID = os.environ.get("BUNDLE_ID", "us.zoom.xos")
 
 AUDIO_TAP_BIN = Path(__file__).parent / ".build" / "process-audio-tap"
 PARTICIPANTS_BIN = Path(__file__).parent / ".build" / "zoom-participants"
-# Off by default — measured net-negative on real chunks. See
-# tools/measure_llm_post.py and the note above _llm_output_is_safe.
-# Set LLM_POST=1 to opt in.
-ENABLE_LLM_POST = os.environ.get("LLM_POST", "0") == "1"
+# On. It only fires on chunks the decoder was unsure of, and everything it
+# returns has to get past _llm_output_is_safe. Set LLM_POST=0 to turn it off.
+ENABLE_LLM_POST = os.environ.get("LLM_POST", "1") == "1"
 LLM_MODEL = os.environ.get("LLM_MODEL", "mlx-community/Qwen3-0.6B-4bit")
 
 # Bounded queues
@@ -1104,9 +1103,12 @@ def _postprocess_text(text: str, timestamp: str) -> str:
                 result = _llm_refine(clean_text, context,
                                      get_remote_participants(), doubtful)
                 accepted, reason = _llm_output_is_safe(clean_text, result)
-                if accepted:
+                if accepted and result.strip() != clean_text.strip():
+                    print(f"[meeting] LLM fixed (unsure of: {', '.join(doubtful[:4])})"
+                          f"\n         before: {clean_text[:100]}"
+                          f"\n         after : {result[:100]}", flush=True)
                     clean_text = result
-                else:
+                elif not accepted:
                     _note_llm_rejection(reason)
         except Exception as e:
             # Never fail the transcript over post-processing — but say so once,
