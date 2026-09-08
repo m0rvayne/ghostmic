@@ -396,7 +396,7 @@ class TestTranscribeChunk:
     """Test transcribe_chunk with mocked subprocess calls."""
 
     def test_silence_below_min_rms_returns_empty(self):
-        """Audio with RMS below MIN_SPEECH_RMS should return empty without calling whisper."""
+        """Audio below the adaptive speech gate returns empty without calling whisper."""
         audio = np.full(16000, 0.001, dtype=np.float32)
         with patch("capture.subprocess.run") as mock_run:
             result = capture_mod.transcribe_chunk(None, audio)
@@ -1066,3 +1066,147 @@ class TestLLMGenerateArgs:
         assert capture_mod._llm_generate("prompt") == "result"
         assert "sampler" not in captured
         assert "temp" not in captured
+
+
+# -- Tests for the adaptive speech gate ----------------------------------------
+
+SAMPLE_RATE = capture_mod.SAMPLE_RATE
+
+
+def _speechlike(target_rms: float, seconds: float = 20.0, seed: int = 0) -> np.ndarray:
+    """Noise shaped like speech: loud stretches separated by pauses.
+
+    A real chunk is not a constant level — it alternates between phrases and
+    gaps, and it is the gaps the noise floor estimator is supposed to find.
+    """
+    rng = np.random.default_rng(seed)
+    n = int(SAMPLE_RATE * seconds)
+    audio = rng.standard_normal(n).astype(np.float32)
+
+    # 500 ms envelope: ~60% voiced, ~40% pause at room-tone level
+    frame = int(SAMPLE_RATE * 0.5)
+    envelope = np.ones(n, dtype=np.float32)
+    for i, start in enumerate(range(0, n, frame)):
+        envelope[start:start + frame] = 1.0 if (i % 5) < 3 else 0.04
+
+    audio *= envelope
+    audio *= target_rms / float(np.sqrt(np.mean(audio ** 2)))
+    return audio
+
+
+def _room_tone(rms: float, seconds: float = 20.0, seed: int = 1) -> np.ndarray:
+    """Flat low-level noise — an empty room with the mic open."""
+    rng = np.random.default_rng(seed)
+    audio = rng.standard_normal(int(SAMPLE_RATE * seconds)).astype(np.float32)
+    return audio * (rms / float(np.sqrt(np.mean(audio ** 2))))
+
+
+class TestNoiseFloor:
+    """Rolling noise floor estimation."""
+
+    def test_empty_floor_reports_zero(self):
+        assert capture_mod.NoiseFloor().level == 0.0
+
+    def test_floor_finds_pauses_not_speech(self):
+        # Speech at 0.02 RMS with pauses at 4% of that — the floor must land
+        # near the pauses, well under the overall level.
+        nf = capture_mod.NoiseFloor()
+        nf.observe(_speechlike(0.02))
+        assert nf.level < 0.02 / 4
+
+    def test_floor_tracks_room_tone(self):
+        nf = capture_mod.NoiseFloor()
+        nf.observe(_room_tone(0.0005))
+        assert 0.0003 < nf.level < 0.0008
+
+    def test_window_is_bounded(self):
+        nf = capture_mod.NoiseFloor(window=10)
+        nf.observe(_room_tone(0.0005, seconds=60))
+        assert len(nf._energies) == 10
+
+    def test_short_audio_counted_whole(self):
+        nf = capture_mod.NoiseFloor()
+        nf.observe(np.full(100, 0.01, dtype=np.float32))  # shorter than a frame
+        assert nf.level == pytest.approx(0.01, rel=1e-3)
+
+    def test_empty_audio_ignored(self):
+        nf = capture_mod.NoiseFloor()
+        nf.observe(np.array([], dtype=np.float32))
+        nf.observe(None)
+        assert nf.level == 0.0
+
+    def test_reset_clears(self):
+        nf = capture_mod.NoiseFloor()
+        nf.observe(_room_tone(0.001))
+        nf.reset()
+        assert nf.level == 0.0
+
+
+class TestSpeechGate:
+    """The gate must follow the signal, not a hardcoded guess."""
+
+    def setup_method(self):
+        capture_mod._mix_noise.reset()
+
+    def teardown_method(self):
+        capture_mod._mix_noise.reset()
+
+    def test_unseen_signal_gates_permissively(self):
+        assert capture_mod.speech_gate() == capture_mod.GATE_MIN
+
+    def test_gate_follows_floor(self):
+        capture_mod._mix_noise.observe(_room_tone(0.001))
+        assert capture_mod.speech_gate() == pytest.approx(0.002, rel=0.3)
+
+    def test_gate_never_exceeds_max(self):
+        capture_mod._mix_noise.observe(_room_tone(0.5))  # very loud room
+        assert capture_mod.speech_gate() == capture_mod.GATE_MAX
+
+    def test_gate_never_drops_below_min(self):
+        capture_mod._mix_noise.observe(_room_tone(1e-6))  # digital silence
+        assert capture_mod.speech_gate() == capture_mod.GATE_MIN
+
+
+class TestGateRegression:
+    """Replays the levels that were logged on 2026-09-07.
+
+    Every value here is a real chunk from watcher.log. Under the old fixed
+    0.01 threshold the first three were discarded as silence; two slots later
+    a 0.0122 chunk from the same conversation transcribed normally.
+    """
+
+    # RMS values that carried speech and must reach Whisper
+    DROPPED_SPEECH = [0.0069, 0.0060, 0.0121, 0.0122]
+    # RMS values that really were silence and should still be skipped
+    TRUE_SILENCE = [0.0005, 0.0004]
+
+    def setup_method(self):
+        capture_mod._mix_noise.reset()
+
+    def teardown_method(self):
+        capture_mod._mix_noise.reset()
+
+    def _transcribes(self, audio) -> bool:
+        """True if the chunk reached whisper-cli."""
+        with patch("capture.subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(returncode=0, stdout=b"text\n")
+            capture_mod.transcribe_chunk(None, audio)
+            return mock_run.called
+
+    @pytest.mark.parametrize("rms", DROPPED_SPEECH)
+    def test_speech_level_chunks_reach_whisper(self, rms):
+        # Establish a realistic floor first, as a live meeting would
+        capture_mod._mix_noise.observe(_room_tone(0.0005))
+        assert self._transcribes(_speechlike(rms)), (
+            f"RMS={rms} was gated out; gate={capture_mod.speech_gate():.4f}")
+
+    @pytest.mark.parametrize("rms", TRUE_SILENCE)
+    def test_silent_chunks_still_skipped(self, rms):
+        capture_mod._mix_noise.observe(_room_tone(0.0005))
+        assert not self._transcribes(_room_tone(rms, seed=7))
+
+    def test_quiet_speaker_on_a_quiet_line(self):
+        # Someone soft-spoken on a line with almost no noise: the old constant
+        # would have discarded the whole conversation.
+        capture_mod._mix_noise.observe(_room_tone(0.0002))
+        assert self._transcribes(_speechlike(0.003))

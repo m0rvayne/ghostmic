@@ -19,6 +19,7 @@ import signal
 import subprocess
 import time
 import threading
+from collections import deque
 from datetime import datetime
 from pathlib import Path
 
@@ -290,7 +291,79 @@ def _strip_hallucinations(text: str) -> str:
 
     return re.sub(r"\s+", " ", " ".join(kept)).strip()
 
-MIN_SPEECH_RMS = 0.01  # below this = silence, skip transcription
+# -- Adaptive noise floor ------------------------------------------------------
+#
+# A fixed RMS gate cannot work here. The tap level follows Zoom's playback
+# volume and the mic level follows input gain, so "quiet" is a different number
+# on every machine and it moves during a call. The old constant (0.01) sat in
+# the middle of ordinary conversation: in the archive, chunks measured at
+# 0.0060 and 0.0069 were discarded as silence while a 0.0122 chunk two slots
+# later transcribed into a normal sentence — same voices, same conversation.
+#
+# Track a rolling low percentile of frame energies instead. Speech has gaps, so
+# a low percentile settles on the real noise floor even when someone talks
+# without pausing, and it follows the device instead of guessing at it.
+
+NOISE_WINDOW_FRAMES = 600   # 500 ms frames — roughly 5 minutes of history
+NOISE_PERCENTILE = 10       # low percentile tracks the floor, not the speech
+NOISE_FRAME_MS = 500
+GATE_MULTIPLIER = 2.0       # a chunk must clear this multiple of the floor
+GATE_MIN = 0.0008           # below this is near-silence on any device
+GATE_MAX = 0.006            # never gate above this — protects quiet speech
+
+
+class NoiseFloor:
+    """Rolling estimate of a channel's noise floor from frame energies."""
+
+    def __init__(self, window: int = NOISE_WINDOW_FRAMES,
+                 percentile: int = NOISE_PERCENTILE):
+        self._energies = deque(maxlen=window)
+        self._percentile = percentile
+        self._lock = threading.Lock()
+
+    def observe(self, audio: np.ndarray, frame_ms: int = NOISE_FRAME_MS):
+        """Record the frame energies of a chunk."""
+        if audio is None or audio.size == 0:
+            return
+        frame_size = int(SAMPLE_RATE * frame_ms / 1000)
+        frames = []
+        if frame_size > 0:
+            for i in range(0, len(audio) - frame_size + 1, frame_size):
+                frames.append(float(np.sqrt(np.mean(audio[i:i + frame_size] ** 2))))
+        if not frames:  # chunk shorter than one frame — use it whole
+            frames.append(float(np.sqrt(np.mean(audio ** 2))))
+        with self._lock:
+            self._energies.extend(frames)
+
+    @property
+    def level(self) -> float:
+        with self._lock:
+            if not self._energies:
+                return 0.0
+            return float(np.percentile(self._energies, self._percentile))
+
+    def reset(self):
+        with self._lock:
+            self._energies.clear()
+
+
+_mix_noise = NoiseFloor()   # gates what reaches Whisper
+_bh_noise = NoiseFloor()    # remote channel, for diarization
+_mic_noise = NoiseFloor()   # local channel, for diarization
+
+
+def speech_gate() -> float:
+    """RMS below which a chunk is certainly silence.
+
+    Deliberately permissive: with whisper-server the model is already resident,
+    so a needless call on a quiet chunk costs a fraction of a second, while a
+    wrongly dropped chunk is speech lost for good. Anything that slips through
+    is cleaned up downstream by _strip_hallucinations and _is_hallucination.
+    """
+    floor = _mix_noise.level
+    if floor <= 0:
+        return GATE_MIN
+    return min(GATE_MAX, max(GATE_MIN, floor * GATE_MULTIPLIER))
 
 
 def _is_hallucination(text: str) -> bool:
@@ -418,8 +491,15 @@ def _transcribe_via_cli(audio_np: np.ndarray, lang: str) -> str:
 
 def transcribe_chunk(model_unused, audio_np: np.ndarray) -> str:
     """Transcribe audio using whisper-server (preferred) or whisper-cli (fallback)."""
-    rms = np.sqrt(np.mean(audio_np ** 2))
-    if rms < MIN_SPEECH_RMS:
+    if audio_np is None or audio_np.size == 0:
+        return ""
+
+    rms = float(np.sqrt(np.mean(audio_np ** 2)))
+    # Observe before gating so the estimate is available on the very first
+    # chunk, and so a call that starts in silence does not gate itself out.
+    _mix_noise.observe(audio_np)
+    gate = speech_gate()
+    if rms < gate:
         return ""
 
     lang = LANGUAGE if LANGUAGE != "auto" else "auto"
@@ -692,7 +772,11 @@ def writer_thread(model, has_mic: bool):
                     _write_transcript(TRANSCRIPT_FILE, line)
                     print(f"[meeting] -> {text[:80]}...", flush=True)
                 else:
-                    print("[meeting] (silence)", flush=True)
+                    # Print the gate alongside the level: a chunk dropped just
+                    # under the gate is the signature of speech being lost, and
+                    # without both numbers that is invisible in the log.
+                    print(f"[meeting] (silence: RMS={rms:.4f}, gate={speech_gate():.4f})",
+                          flush=True)
                     _touch_heartbeat(TRANSCRIPT_FILE)
 
                 last_heartbeat = time.monotonic()
