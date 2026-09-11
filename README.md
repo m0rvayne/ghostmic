@@ -131,8 +131,9 @@ Names and domain terms go in `~/.ghostmic/config.json`:
 { "glossary": ["Claude Code", "MCP", "майнд-карта", "Researcher"] }
 ```
 
-These are fed to whisper as an initial prompt, which biases decoding toward the
-spelling you want. It is the difference between
+These are fed to whisper as an initial prompt — a bare comma-separated list,
+deliberately — which biases decoding toward the spelling you want. It is the
+difference between
 
 ```
 without:  «Мы обсудили Клод Кот и Майнд Карту в Ресерчере»
@@ -143,6 +144,12 @@ Participant names detected from the Zoom window are appended automatically, and
 go last because the end of the prompt carries the most weight. Only the last 224
 tokens are used, so keep the list to terms whisper actually gets wrong. Edits
 take effect on the next chunk — no restart.
+
+Keep it short for a second reason. A prompt becomes context the decoder can
+continue instead of transcribing, which is a documented whisper behaviour: an
+earlier version opened with a sentence and whisper wrote that sentence into 232
+transcript lines. The prompt is a bare list now, and leading echoes of it are
+stripped from the output, but a long list is still more surface for this.
 
 ## Why ghostmic vs competitors
 

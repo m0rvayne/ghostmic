@@ -1547,3 +1547,60 @@ class TestLanguageDefault:
             if saved is not None:
                 os.environ["LANGUAGE"] = saved
             importlib.reload(capture_mod)
+
+
+class TestPromptEchoStripping:
+    """whisper writes the vocabulary prompt out as speech when the audio is
+    unclear — 232 lines across six live meetings started with it."""
+
+    TERMS = ["Claude Code", "MCP", "майнд-карта", "Валера"]
+
+    def strip(self, text):
+        return capture_mod.strip_prompt_echo(text, self.TERMS)
+
+    def test_pure_echo_becomes_empty(self):
+        assert self.strip("Claude Code, MCP, майнд-карта, Валера") == ""
+
+    def test_echo_glued_in_front_of_speech_keeps_the_speech(self):
+        assert self.strip("Claude Code, MCP: Саши тоже долго думал над этим") \
+            == "Саши тоже долго думал над этим"
+
+    def test_dash_separated_echo(self):
+        assert self.strip("MCP, Валера — и вот это очень важно") == "и вот это очень важно"
+
+    def test_terms_mid_sentence_are_left_alone(self):
+        """Someone saying the word is not the prompt leaking."""
+        line = "мы обсудили MCP и майнд-карту подробно"
+        assert self.strip(line) == line
+
+    def test_a_single_leading_term_is_not_an_echo(self):
+        """A sentence may open with a product name."""
+        line = "MCP, кстати, вчера сломался"
+        assert self.strip(line) == line
+
+    def test_ordinary_speech_untouched(self):
+        line = "Обычная реплика без всякого эха"
+        assert self.strip(line) == line
+
+    def test_no_terms_means_no_stripping(self):
+        assert capture_mod.strip_prompt_echo("Claude Code, MCP", []) == "Claude Code, MCP"
+
+    def test_empty_text(self):
+        assert self.strip("") == ""
+
+    def test_quoted_echo(self):
+        assert self.strip('"Claude Code", "MCP": реальная реплика') == "реальная реплика"
+
+
+class TestPromptIsABareList:
+    def test_no_lead_in_phrase(self):
+        """The lead-in was what whisper carried on writing."""
+        p = capture_mod.build_whisper_prompt(participants=["Валера"],
+                                             glossary=["MCP"])
+        assert "Участники" not in p and "Совещание" not in p
+        assert p == "MCP, Валера"
+
+    def test_terms_recoverable_from_a_rendered_prompt(self):
+        p = capture_mod.build_whisper_prompt(participants=["Валера"],
+                                             glossary=["Claude Code", "MCP"])
+        assert capture_mod._prompt_terms(p) == ["Claude Code", "MCP", "Валера"]

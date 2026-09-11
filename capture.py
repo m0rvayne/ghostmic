@@ -373,7 +373,6 @@ _whisper_server_available = False  # set True after successful health check
 
 CONFIG_FILE = Path(__file__).parent / "config.json"
 WHISPER_PROMPT_MAX_CHARS = 600  # ~224 tokens of mixed RU/EN, conservatively
-_PROMPT_PREFIX = "Совещание. Участники и термины: "
 
 
 def _load_glossary() -> list[str]:
@@ -390,7 +389,20 @@ def _load_glossary() -> list[str]:
 
 
 def _render_prompt(terms: list[str]) -> str:
-    return f"{_PROMPT_PREFIX}{', '.join(terms)}."
+    """A bare list, deliberately.
+
+    The first version opened with "Совещание. Участники и термины: …", and
+    whisper continued that sentence instead of transcribing whenever the audio
+    was unclear — 232 lines across six live meetings began with it, sometimes
+    glued in front of real speech, sometimes in place of it. A lead-in is an
+    invitation to carry on writing; a list of nouns is not.
+    """
+    return ", ".join(terms)
+
+
+def _prompt_terms(prompt: str) -> list[str]:
+    """The terms that went into a rendered prompt."""
+    return [t.strip() for t in prompt.split(",") if t.strip()] if prompt else []
 
 
 def build_whisper_prompt(participants: list[str] | None = None,
@@ -419,6 +431,42 @@ def build_whisper_prompt(participants: list[str] | None = None,
     while len(terms) > 1 and len(_render_prompt(terms)) > max_chars:
         terms.pop(0)
     return _render_prompt(terms)[:max_chars]
+
+
+_ECHO_SPLIT_RE = re.compile(r"[,;:]|\s+[—-]\s+")
+MIN_ECHO_TERMS = 2
+
+
+def strip_prompt_echo(text: str, terms: list[str]) -> str:
+    """Remove the vocabulary prompt when whisper writes it out as speech.
+
+    Documented whisper behaviour: the initial prompt becomes decoder context,
+    and on unclear audio the model carries on producing it. Rewording helps and
+    does not settle it, so the output is cleaned too. Only leading fragments are
+    removed — a glossary term appearing mid-sentence is almost certainly someone
+    actually saying it.
+    """
+    if not text or not terms:
+        return text
+
+    known = {t.casefold().strip(" .!?\"«»") for t in terms}
+    known.discard("")
+
+    parts = _ECHO_SPLIT_RE.split(text)
+    dropped = 0
+    for i, part in enumerate(parts):
+        if part.casefold().strip(" .!?\"«»") in known:
+            dropped = i + 1
+            continue
+        break
+
+    # One leading term is not evidence: someone can open a sentence with a
+    # product name. An echo of a comma-separated list rarely stops at one.
+    if dropped < MIN_ECHO_TERMS:
+        return text
+
+    remainder = _ECHO_SPLIT_RE.split(text, maxsplit=dropped)[dropped] if dropped < len(parts) else ""
+    return remainder.lstrip(" ,;:—-\"«»").strip()
 
 
 def format_time(dt: datetime) -> str:
@@ -853,7 +901,8 @@ def transcribe_chunk(model_unused, audio_np: np.ndarray) -> str:
         return ""
 
     # Strip canned outros/sound events first — a chunk may hold real speech too
-    text = _strip_hallucinations(result.text)
+    text = strip_prompt_echo(result.text, _prompt_terms(prompt))
+    text = _strip_hallucinations(text)
     if _is_hallucination(text):
         _set_last_transcription(Transcription(text=""))
         return ""
