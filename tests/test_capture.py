@@ -1722,8 +1722,11 @@ class TestPromptAllowsTermCorrection:
         assert "Do not change numbers." in p
 
     def test_model_told_to_map_garbled_words_onto_terms(self):
+        """Wording tightened after the untargeted run rewrote real names; the
+        permission to substitute must survive that."""
         p = capture_mod._build_llm_prompt("чанк", "контекст", [], None, ["MCP"])
-        assert "garbled attempt at one of the known terms" in p
+        assert "may be replaced with a known term" in p
+        assert "garbled Researcher" in p
 
     def test_inventing_unlisted_names_still_forbidden(self):
         p = capture_mod._build_llm_prompt("чанк", "контекст", [], None, ["MCP"])
@@ -1791,3 +1794,40 @@ class TestLanguageConfidenceGate:
         for _ in range(capture_mod.LANGUAGE_LOCK_VOTES):
             capture_mod._maybe_lock_language(self._chunk(0.0))
         assert capture_mod.effective_language() == "ru"
+
+
+class TestReplacementScope:
+    """The model was rewriting correctly heard product names into whichever
+    glossary entry looked closest: "Codex" -> "Claude Code"."""
+
+    def test_only_doubtful_words_may_be_replaced(self):
+        p = capture_mod._build_llm_prompt("чанк", "ctx", [], ["ресерчер"], ["Researcher"])
+        assert "Only these words may be replaced: ресерчер." in p
+
+    def test_no_scope_line_without_doubtful_words(self):
+        p = capture_mod._build_llm_prompt("чанк", "ctx", [], None, ["Researcher"])
+        assert "Only these words may be replaced" not in p
+
+    def test_real_names_are_protected_by_name(self):
+        p = capture_mod._build_llm_prompt("чанк", "ctx", [], None, ["Researcher"])
+        assert "Codex" in p and "must be left exactly as they are" in p
+
+
+class TestMarkdownStripping:
+    """The model emphasises terms it corrects. Nobody speaks in bold."""
+
+    def test_bold_removed(self):
+        assert capture_mod._strip_think_block("скажи своему **Claude Code** быстро") \
+            == "скажи своему Claude Code быстро"
+
+    def test_italic_removed(self):
+        assert capture_mod._strip_think_block("это *важно* очень") == "это важно очень"
+
+    def test_underscore_emphasis_removed(self):
+        assert capture_mod._strip_think_block("это __важно__ очень") == "это важно очень"
+
+    def test_lone_asterisk_left_alone(self):
+        assert capture_mod._strip_think_block("умножить 5 * 3") == "умножить 5 * 3"
+
+    def test_plain_text_untouched(self):
+        assert capture_mod._strip_think_block("обычная реплика") == "обычная реплика"

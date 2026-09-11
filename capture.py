@@ -1003,6 +1003,8 @@ def _llm_generate(formatted_prompt: str, max_tokens: int = 150) -> str:
 
 _THINK_BLOCK_RE = re.compile(r"<think>.*?</think>", re.DOTALL)
 _FENCE_RE = re.compile(r"</?(?:chunk|context)>")
+# The model emphasises the term it just corrected: "своему **Claude Code**".
+_MARKDOWN_EMPHASIS_RE = re.compile(r"(\*{1,3}|_{2,3})(?=\S)(.+?)(?<=\S)\1", re.DOTALL)
 
 
 def _strip_think_block(text: str) -> str:
@@ -1015,7 +1017,11 @@ def _strip_think_block(text: str) -> str:
     text = _THINK_BLOCK_RE.sub(" ", text).replace("<think>", " ").replace("</think>", " ")
     # The chunk is fenced in the prompt and the model sometimes echoes the
     # fence back around its answer.
-    return _FENCE_RE.sub(" ", text).strip()
+    text = _FENCE_RE.sub(" ", text)
+    # Nobody speaks in bold. Markdown around a corrected term would go straight
+    # into the transcript and then into whatever quotes it.
+    text = _MARKDOWN_EMPHASIS_RE.sub(r"\2", text)
+    return text.strip()
 
 
 def _llm_refine(clean_text: str, context: str, participants: list[str],
@@ -1076,6 +1082,12 @@ def _build_llm_prompt(clean_text: str, context: str, participants: list[str],
             "\nKnown terms, spelled the way they should appear:\n"
             f"{', '.join(glossary)}\n")
 
+    # When the recogniser named the words it was unsure of, nothing else is a
+    # candidate for replacement. Without this the model rewrote correctly heard
+    # product names into whichever glossary entry looked closest.
+    scope = ("\n- Only these words may be replaced: "
+             f"{', '.join(doubtful)}." if doubtful else "")
+
     return f"""You are repairing one chunk of an automatic speech-to-text transcript.
 
 Earlier chunks, for reference only. Do NOT continue them, do NOT copy from them:
@@ -1090,9 +1102,10 @@ The chunk to repair:
 {doubtful_block}{glossary_block}{f"People in this meeting: {people}" if people else ""}
 Rules:
 - Output the chunk again, repairing what is clearly a recognition error.
-- Where a word is a garbled attempt at one of the known terms above, replace it
-  with that term spelled exactly as listed. Use the context to judge which term
-  was meant; if none fits, leave the word alone.
+- A word may be replaced with a known term only when it is not a real word or
+  product name on its own — "ресерчер" is a garbled Researcher, but "Codex" and
+  "Mind Manager" are things that exist and must be left exactly as they are,
+  even when a listed term looks similar.{scope}
 - Copy every other word exactly as it appears.
 - Do not continue the conversation. Do not add or remove sentences.
 - Do not change numbers. Do not introduce names that are not listed above.

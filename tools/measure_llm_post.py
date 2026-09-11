@@ -57,7 +57,12 @@ def load_samples(directory: Path, count: int, seed: int = 0):
 
 
 def run_once(text: str, context: str) -> str:
-    return capture._llm_refine(text, context, [])
+    """Exercise the production path: glossary in, doubtful words out.
+
+    The archive carries no per-word confidence, so nothing can be named as
+    doubtful here — this is the untargeted case, which is the harder one.
+    """
+    return capture._llm_refine(text, context, [], None, capture._load_glossary())
 
 
 def main():
