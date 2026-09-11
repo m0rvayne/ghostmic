@@ -341,6 +341,8 @@ def _build_diarized_text(text: str, segments: list[tuple[str, int, int]],
 # -- Transcription (whisper.cpp with Metal GPU) --------------------------------
 
 WHISPER_CLI = os.environ.get("WHISPER_CLI", "whisper-cli")
+# 8 measured 4.2x realtime against 3.6x at 4 on an idle machine.
+WHISPER_THREADS = os.environ.get("WHISPER_THREADS", "8")
 WHISPER_SERVER_BIN = os.environ.get("WHISPER_SERVER", "whisper-server")
 MODELS_DIR = Path(__file__).parent / "models"
 WHISPER_MODEL = os.environ.get("WHISPER_MODEL", "large-v3-turbo")
@@ -849,7 +851,7 @@ def _transcribe_via_cli(audio_np: np.ndarray, lang: str, prompt: str = "") -> Tr
             "-m", WHISPER_MODEL_PATH,
             "-f", tmp_wav,
             "--no-timestamps",
-            "-t", "8",
+            "-t", WHISPER_THREADS,
             "-sow",  # split segments on words, not mid-word — see watcher.py
             # Do not carry text context between segments. This is the
             # condition_on_previous_text=False from d77a56f, which the move to

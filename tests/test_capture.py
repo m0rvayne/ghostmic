@@ -575,7 +575,8 @@ class TestTranscribeChunk:
         assert "-f" in whisper_args
         assert "--no-timestamps" in whisper_args
         assert "-t" in whisper_args
-        assert "4" in whisper_args
+        # The count itself is a tuning knob; what matters is that it is passed.
+        assert capture_mod.WHISPER_THREADS in whisper_args
 
     def test_whisper_cli_includes_language_flag(self):
         """When LANGUAGE is not 'auto', -l flag should be present."""
