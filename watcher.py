@@ -355,6 +355,10 @@ def start_whisper_server(ctx: WatcherContext):
         "--port", str(WHISPER_SERVER_PORT),
         "-t", "4",
         "--convert",
+        # Split segments on word boundaries. Without this whisper cuts mid-word
+        # — "кусоч" ends one segment and "ками" begins the next — and joining
+        # them puts a space inside the word.
+        "-sow",
     ]
     if language and language != "auto":
         cmd.extend(["-l", language])

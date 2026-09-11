@@ -774,6 +774,7 @@ def _transcribe_via_cli(audio_np: np.ndarray, lang: str, prompt: str = "") -> Tr
             "-f", tmp_wav,
             "--no-timestamps",
             "-t", "4",
+            "-sow",  # split segments on words, not mid-word — see watcher.py
         ]
         if lang != "auto":
             whisper_cmd.extend(["-l", lang])

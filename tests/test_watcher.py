@@ -422,8 +422,18 @@ class TestWhisperServerLifecycle:
         ctx = watcher.WatcherContext(config=config)
         assert ctx.whisper_server_process is None
 
-    def test_server_healthy_false_when_not_running(self):
-        assert watcher._whisper_server_healthy() is False
+    def test_server_healthy_false_when_unreachable(self):
+        """Was a real HTTP call to :8178, so it failed whenever ghostmic was
+        actually running on the machine — the product's own server answered."""
+        with patch("urllib.request.urlopen", side_effect=OSError("refused")):
+            assert watcher._whisper_server_healthy() is False
+
+    def test_server_healthy_true_when_it_answers(self):
+        resp = MagicMock(status=200)
+        resp.__enter__ = MagicMock(return_value=resp)
+        resp.__exit__ = MagicMock(return_value=False)
+        with patch("urllib.request.urlopen", return_value=resp):
+            assert watcher._whisper_server_healthy() is True
 
     def test_start_whisper_server_skips_if_healthy(self, config):
         ctx = watcher.WatcherContext(config=config)
@@ -645,3 +655,31 @@ class TestMissingModelFallback:
         cfg = self._config(tmp_path, [])
         path, _ = watcher.whisper_settings(cfg, {"whisper_model": "medium"})
         assert path.endswith("ggml-medium.bin")  # caller reports it missing
+
+
+class TestSegmentSplitting:
+    """whisper cuts segments mid-word unless told otherwise: "кусоч" ends one
+    and "ками" begins the next, and joining them yields "кусоч ками"."""
+
+    def test_server_is_started_with_split_on_word(self, tmp_path, monkeypatch):
+        (tmp_path / "models").mkdir()
+        model = tmp_path / "models" / "ggml-large-v3-turbo.bin"
+        model.write_bytes(b"x")
+        monkeypatch.setenv("WHISPER_MODEL_PATH", str(model))
+        cfg = watcher.WatcherConfig(**{**watcher.default_config().__dict__,
+                                       "install_dir": tmp_path})
+        ctx = watcher.WatcherContext(config=cfg)
+
+        # False to get past the "already running" check, then True so the
+        # readiness loop returns at once instead of sleeping 30 seconds.
+        with patch.object(watcher, "_whisper_server_healthy",
+                          side_effect=[False, True]), \
+             patch.object(watcher.subprocess, "run") as run, \
+             patch.object(watcher.subprocess, "Popen") as popen, \
+             patch.object(watcher.time, "sleep"):
+            run.return_value = MagicMock(returncode=0, stdout="/usr/bin/whisper-server\n")
+            popen.return_value = MagicMock(pid=1, poll=MagicMock(return_value=None))
+            watcher.start_whisper_server(ctx)
+
+        assert popen.called, "server was never started"
+        assert "-sow" in popen.call_args[0][0]
