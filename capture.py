@@ -51,7 +51,11 @@ PARTICIPANTS_BIN = Path(__file__).parent / ".build" / "zoom-participants"
 # On. It only fires on chunks the decoder was unsure of, and everything it
 # returns has to get past _llm_output_is_safe. Set LLM_POST=0 to turn it off.
 ENABLE_LLM_POST = os.environ.get("LLM_POST", "1") == "1"
-LLM_MODEL = os.environ.get("LLM_MODEL", "mlx-community/Qwen3-0.6B-4bit")
+# 4B is where the repair pass starts doing the job. Measured on three garbled
+# product names: 0.6B and 1.7B changed nothing at all; 4B returned MindManager,
+# Claude Code and Researcher. Costs 2.1 GB on disk, ~1 GB resident and ~2s per
+# chunk — and it only runs on chunks whisper was unsure of, about 5% of them.
+LLM_MODEL = os.environ.get("LLM_MODEL", "mlx-community/Qwen3-4B-4bit")
 
 # Bounded queues
 audio_queue = queue.Queue(maxsize=MAX_QUEUE_CHUNKS)

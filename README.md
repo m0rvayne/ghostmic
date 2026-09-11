@@ -68,8 +68,15 @@ Transcript file ──> server.py (MCP) ──> Claude Desktop / Claude Code
 
 ### The LLM repair pass
 
-A Qwen3-0.6B stage runs after transcription. Turn it off with `LLM_POST=0`,
+A Qwen3-4B stage runs after transcription. Turn it off with `LLM_POST=0`,
 pick a different model with `LLM_MODEL`.
+
+Model size matters here more than it usually does. On three garbled product
+names — "Майндменеджер", "Клод Кот", "ресерчер" — Qwen3-0.6B and Qwen3-1.7B
+changed nothing at all, while Qwen3-4B returned MindManager, Claude Code and
+Researcher. Mapping a misheard word onto the right term needs enough model to
+hold the context. 4B costs 2.1 GB on disk, about 1 GB resident and ~2s per
+chunk, and it only runs on the chunks whisper was unsure of.
 
 It is deliberately quiet. It is only called on chunks where whisper reported
 low confidence in a word — with nothing doubtful there is nothing to repair,
@@ -88,10 +95,7 @@ so you can see what it is doing rather than trust that it is doing something.
 
 **Measured, so you know what you are getting.** `tools/measure_llm_post.py`
 runs the production prompt through the production model over real chunks from
-your own archive. On 60 chunks with Qwen3-0.6B: 38 untouched, 16 rejected by
-the guard, 6 changed — one real repair, two cosmetic, one mixed, and two that
-put case errors into correct Russian. A larger model in `LLM_MODEL` is the
-lever if that trade is not good enough; run the harness and compare.
+your own archive — pass `--model` to compare candidates on the same material.
 
 ## Install
 
