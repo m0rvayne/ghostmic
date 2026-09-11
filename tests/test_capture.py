@@ -1604,3 +1604,95 @@ class TestPromptIsABareList:
         p = capture_mod.build_whisper_prompt(participants=["Валера"],
                                              glossary=["Claude Code", "MCP"])
         assert capture_mod._prompt_terms(p) == ["Claude Code", "MCP", "Валера"]
+
+
+class TestChunkBounding:
+    """Transcription runs near 1x realtime, so a backlog compounds: a longer
+    chunk is slower, which leaves more audio buffered, which is longer still."""
+
+    def test_chunk_is_capped(self):
+        assert capture_mod.MAX_CHUNK_SECONDS <= 30
+
+    def test_short_audio_passes_through_whole(self):
+        a = np.arange(100, dtype=np.float32)
+        head, rest = capture_mod.bound_chunk(a, 200)
+        assert len(head) == 100 and rest is None
+
+    def test_long_audio_is_split_not_truncated(self):
+        """The original cap in 7fc7262 threw the excess away."""
+        a = np.arange(500, dtype=np.float32)
+        head, rest = capture_mod.bound_chunk(a, 200)
+        assert len(head) == 200
+        assert len(rest) == 300
+        assert np.array_equal(np.concatenate([head, rest]), a), "no audio lost"
+
+    def test_exactly_at_the_bound(self):
+        a = np.arange(200, dtype=np.float32)
+        head, rest = capture_mod.bound_chunk(a, 200)
+        assert len(head) == 200 and rest is None
+
+    def test_degenerate_inputs(self):
+        assert capture_mod.bound_chunk(None, 10) == (None, None)
+        a = np.arange(10, dtype=np.float32)
+        head, rest = capture_mod.bound_chunk(a, 0)
+        assert rest is None and len(head) == 10
+
+
+class TestDropReasons:
+    """A failure must never be reported as silence."""
+
+    def setup_method(self):
+        capture_mod._mix_noise.reset()
+
+    def teardown_method(self):
+        capture_mod._mix_noise.reset()
+
+    def test_gated_silence_has_no_reason(self):
+        capture_mod.transcribe_chunk(None, _room_tone(1e-6, seconds=2))
+        assert capture_mod.last_transcription().dropped_reason == ""
+
+    def test_server_timeout_is_recorded_as_such(self):
+        capture_mod._whisper_server_available = True
+        try:
+            with patch.object(capture_mod, "_transcribe_via_server",
+                              side_effect=TimeoutError("timed out")), \
+                 patch.object(capture_mod, "build_whisper_prompt", return_value=""):
+                out = capture_mod.transcribe_chunk(None, _speechlike(0.02))
+        finally:
+            capture_mod._whisper_server_available = False
+        assert out == ""
+        assert "timed out" in capture_mod.last_transcription().dropped_reason
+
+    def test_timeout_does_not_fall_through_to_the_cli(self):
+        """The CLI reloads the model and is slower — retrying doubles the loss."""
+        capture_mod._whisper_server_available = True
+        try:
+            with patch.object(capture_mod, "_transcribe_via_server",
+                              side_effect=TimeoutError("timed out")), \
+                 patch.object(capture_mod, "_transcribe_via_cli") as cli, \
+                 patch.object(capture_mod, "build_whisper_prompt", return_value=""):
+                capture_mod.transcribe_chunk(None, _speechlike(0.02))
+        finally:
+            capture_mod._whisper_server_available = False
+        cli.assert_not_called()
+
+    def test_guessed_chunk_says_so(self):
+        junk = capture_mod.Transcription("мусор", [(f" w{i}", 0.1) for i in range(8)])
+        with patch.object(capture_mod, "_transcribe_via_cli", return_value=junk), \
+             patch.object(capture_mod, "build_whisper_prompt", return_value=""):
+            capture_mod.transcribe_chunk(None, _speechlike(0.02))
+        assert "guessed" in capture_mod.last_transcription().dropped_reason
+
+    def test_non_timeout_failure_still_tries_the_cli(self):
+        capture_mod._whisper_server_available = True
+        good = capture_mod.Transcription("реальная реплика целиком",
+                                         [(f" w{i}", 0.95) for i in range(6)])
+        try:
+            with patch.object(capture_mod, "_transcribe_via_server",
+                              side_effect=ValueError("broken json")), \
+                 patch.object(capture_mod, "_transcribe_via_cli", return_value=good) as cli, \
+                 patch.object(capture_mod, "build_whisper_prompt", return_value=""):
+                capture_mod.transcribe_chunk(None, _speechlike(0.02))
+        finally:
+            capture_mod._whisper_server_available = False
+        cli.assert_called_once()

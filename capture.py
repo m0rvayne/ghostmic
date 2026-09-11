@@ -16,12 +16,13 @@ import os
 import queue
 import re
 import signal
+import socket
 import subprocess
 import time
 import threading
 from collections import deque
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import numpy as np
@@ -29,6 +30,14 @@ import numpy as np
 SAMPLE_RATE = 16000
 CHANNELS = 1
 CHUNK_SECONDS = 10
+# Transcription runs at roughly 1x realtime on this hardware, so any hiccup
+# leaves audio in the buffer and the next chunk is longer — which is slower
+# again. Measured on a live meeting: chunks reached 32s, transcription of a 31s
+# chunk took 21-30s, the 30s timeout fired, the failure cost another 60s, and
+# the next chunk was 60s. Bounding the chunk breaks that loop. The remainder
+# stays in the buffer rather than being thrown away, which is what the original
+# cap in 7fc7262 did before it was lost in the whisper.cpp migration.
+MAX_CHUNK_SECONDS = 20
 MAX_QUEUE_CHUNKS = 240  # ~4 min of audio in queue items
 _DEFAULT_TRANSCRIPT = Path(__file__).parent / "transcripts" / "meeting_transcript.txt"
 TRANSCRIPT_FILE = Path(os.environ.get("TRANSCRIPT_FILE", _DEFAULT_TRANSCRIPT))
@@ -689,6 +698,9 @@ class Transcription:
     text: str
     tokens: list[tuple[str, float]] = field(default_factory=list)
     language: str = ""
+    # Why this chunk produced nothing. Empty when it produced text, or when it
+    # was genuinely silent — anything else must not be reported as silence.
+    dropped_reason: str = ""
 
     @property
     def has_confidence(self) -> bool:
@@ -799,7 +811,10 @@ def _transcribe_via_server(wav_bytes: bytes, lang: str, prompt: str = "") -> Tra
     req = urllib.request.Request(url, data=body, method="POST")
     req.add_header("Content-Type", f"multipart/form-data; boundary={boundary}")
 
-    with urllib.request.urlopen(req, timeout=30) as resp:
+    # A 31s chunk measured 21-30s to transcribe, so a flat 30s timeout fires on
+    # exactly the chunks that are hardest to lose.
+    seconds = max(1.0, len(wav_bytes) / (SAMPLE_RATE * 2))
+    with urllib.request.urlopen(req, timeout=max(30.0, seconds * 3)) as resp:
         return _parse_verbose_json(_json.loads(resp.read()))
 
 
@@ -829,7 +844,9 @@ def _transcribe_via_cli(audio_np: np.ndarray, lang: str, prompt: str = "") -> Tr
         if prompt:
             whisper_cmd.extend(["--prompt", prompt])
 
-        r = subprocess.run(whisper_cmd, capture_output=True, timeout=30)
+        seconds = len(audio_np) / SAMPLE_RATE
+        r = subprocess.run(whisper_cmd, capture_output=True,
+                           timeout=max(30.0, seconds * 4))
         text = r.stdout.decode("utf-8", errors="replace").strip()
         text = text.replace("[BLANK_AUDIO]", "").strip()
         lines = [l.strip() for l in text.split("\n") if l.strip() and not l.strip().startswith("[")]
@@ -872,6 +889,7 @@ def transcribe_chunk(model_unused, audio_np: np.ndarray) -> str:
     _mix_noise.observe(audio_np)
     gate = speech_gate()
     if rms < gate:
+        _set_last_transcription(Transcription(text=""))
         return ""
 
     lang = effective_language()
@@ -883,6 +901,16 @@ def transcribe_chunk(model_unused, audio_np: np.ndarray) -> str:
             wav_bytes = _audio_to_wav_bytes(audio_np)
             result = _transcribe_via_server(wav_bytes, lang, prompt)
         except Exception as e:
+            # A timeout means the machine is already behind. The CLI reloads the
+            # model on every call and is slower still, so falling through to it
+            # doubles the cost of the failure and makes the next chunk longer.
+            if isinstance(e, (socket.timeout, TimeoutError)) or "timed out" in str(e):
+                print(f"[meeting] Server timed out on {len(audio_np) / SAMPLE_RATE:.0f}s "
+                      f"of audio — dropping this chunk rather than falling further behind",
+                      file=sys.stderr, flush=True)
+                _set_last_transcription(
+                    Transcription(text="", dropped_reason="server timed out"))
+                return ""
             print(f"[meeting] Server transcription failed, falling back to CLI: {e}",
                   file=sys.stderr, flush=True)
             result = _transcribe_via_cli(audio_np, lang, prompt)
@@ -897,14 +925,16 @@ def transcribe_chunk(model_unused, audio_np: np.ndarray) -> str:
     if result.looks_like_noise:
         print(f"[meeting] (discarded: {result.low_confidence_fraction:.0%} of words "
               f"below {WORD_CONFIDENCE_FLOOR} confidence) {result.text[:60]}", flush=True)
-        _set_last_transcription(Transcription(text=""))
+        _set_last_transcription(Transcription(
+            text="", dropped_reason=f"{result.low_confidence_fraction:.0%} of words guessed"))
         return ""
 
     # Strip canned outros/sound events first — a chunk may hold real speech too
     text = strip_prompt_echo(result.text, _prompt_terms(prompt))
     text = _strip_hallucinations(text)
     if _is_hallucination(text):
-        _set_last_transcription(Transcription(text=""))
+        _set_last_transcription(
+            Transcription(text="", dropped_reason="filtered as a known artefact"))
         return ""
 
     _set_last_transcription(Transcription(text=text, tokens=result.tokens))
@@ -1182,6 +1212,17 @@ def _postprocess_text(text: str, timestamp: str) -> str:
     return clean_text
 
 
+def bound_chunk(audio: np.ndarray, max_samples: int):
+    """Split a buffered run into (what to transcribe now, what to keep).
+
+    The original cap in 7fc7262 truncated and dropped the excess. Keeping it
+    means a backlog delays audio instead of losing it.
+    """
+    if audio is None or len(audio) <= max_samples or max_samples <= 0:
+        return audio, None
+    return audio[:max_samples], audio[max_samples:]
+
+
 def _drain_queue(q: queue.Queue) -> list:
     items = []
     while True:
@@ -1249,11 +1290,21 @@ def writer_thread(model, has_mic: bool):
                     print("[meeting] No new audio — flushing partial buffer", flush=True)
                 audio_bh = np.concatenate([b.flatten() for b in buffer_bh]).astype(np.float32)
                 buffer_bh = []
+                max_samples = SAMPLE_RATE * MAX_CHUNK_SECONDS
+                audio_bh, rest = bound_chunk(audio_bh, max_samples)
+                if rest is not None:
+                    print(f"[meeting] Backlog: {(len(audio_bh) + len(rest)) / SAMPLE_RATE:.0f}s "
+                          f"buffered, taking {MAX_CHUNK_SECONDS}s and keeping the rest",
+                          flush=True)
+                    buffer_bh = [rest]
 
                 audio_mic_raw = None
                 if has_mic and buffer_mic:
                     audio_mic_raw = np.concatenate([b.flatten() for b in buffer_mic]).astype(np.float32)
                     buffer_mic = []
+                    audio_mic_raw, mic_rest = bound_chunk(audio_mic_raw, max_samples)
+                    if mic_rest is not None:
+                        buffer_mic = [mic_rest]
                     # Trim to shorter channel — padding with zeros causes false speaker labels
                     min_len = min(len(audio_bh), len(audio_mic_raw))
                     audio_bh_padded = audio_bh[:min_len]
@@ -1269,7 +1320,10 @@ def writer_thread(model, has_mic: bool):
                     _bh_noise.observe(audio_bh_padded)
                     _mic_noise.observe(audio_mic_padded)
 
-                chunk_end = datetime.now()
+                # From the audio actually processed. Wall clock made a 20s
+                # chunk read as spanning 63 seconds whenever transcription
+                # fell behind, which is a lie the agent tools then quote.
+                chunk_end = chunk_start + timedelta(seconds=len(audio_mixed) / SAMPLE_RATE)
 
                 rms = np.sqrt(np.mean(audio_mixed ** 2))
                 nonzero = np.count_nonzero(audio_mixed)
@@ -1293,11 +1347,18 @@ def writer_thread(model, has_mic: bool):
                     _write_transcript(TRANSCRIPT_FILE, line)
                     print(f"[meeting] -> {text[:80]}...", flush=True)
                 else:
-                    # Print the gate alongside the level: a chunk dropped just
-                    # under the gate is the signature of speech being lost, and
-                    # without both numbers that is invisible in the log.
-                    print(f"[meeting] (silence: RMS={rms:.4f}, gate={speech_gate():.4f})",
-                          flush=True)
+                    reason = last_transcription().dropped_reason
+                    if reason:
+                        # Not silence. Saying "silence" here sent a chunk at ten
+                        # times the gate into the log as if the gate had dropped
+                        # it, which hid a transcription failure completely.
+                        print(f"[meeting] (dropped: {reason}, RMS={rms:.4f})", flush=True)
+                    else:
+                        # Print the gate alongside the level: a chunk dropped
+                        # just under the gate is the signature of speech being
+                        # lost, and without both numbers that is invisible.
+                        print(f"[meeting] (silence: RMS={rms:.4f}, gate={speech_gate():.4f})",
+                              flush=True)
                     _touch_heartbeat(TRANSCRIPT_FILE)
 
                 last_heartbeat = time.monotonic()
