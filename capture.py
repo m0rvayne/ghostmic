@@ -849,7 +849,7 @@ def _transcribe_via_cli(audio_np: np.ndarray, lang: str, prompt: str = "") -> Tr
             "-m", WHISPER_MODEL_PATH,
             "-f", tmp_wav,
             "--no-timestamps",
-            "-t", "4",
+            "-t", "8",
             "-sow",  # split segments on words, not mid-word — see watcher.py
             # Do not carry text context between segments. This is the
             # condition_on_previous_text=False from d77a56f, which the move to

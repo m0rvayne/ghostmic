@@ -353,7 +353,11 @@ def start_whisper_server(ctx: WatcherContext):
         "-m", model_path,
         "--host", "127.0.0.1",
         "--port", str(WHISPER_SERVER_PORT),
-        "-t", "4",
+        # 8 threads measured 4.2x realtime against 3.6x at 4, on an idle
+        # machine. Under a live call the GPU is contended by Zoom's video and
+        # throughput drops to about 1x either way — the bound on chunk size is
+        # what keeps that from compounding, not this.
+        "-t", "8",
         "--convert",
         # Split segments on word boundaries. Without this whisper cuts mid-word
         # — "кусоч" ends one segment and "ками" begins the next — and joining
