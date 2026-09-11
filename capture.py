@@ -1000,9 +1000,10 @@ def _strip_think_block(text: str) -> str:
 
 
 def _llm_refine(clean_text: str, context: str, participants: list[str],
-                doubtful: list[str] | None = None) -> str:
+                doubtful: list[str] | None = None,
+                glossary: list[str] | None = None) -> str:
     """Run one post-processing pass. Returns the model's cleaned-up output."""
-    prompt = _build_llm_prompt(clean_text, context, participants, doubtful)
+    prompt = _build_llm_prompt(clean_text, context, participants, doubtful, glossary)
     messages = [{"role": "user", "content": prompt}]
     try:
         formatted = _llm_tokenizer.apply_chat_template(
@@ -1032,7 +1033,8 @@ def _load_llm():
 
 
 def _build_llm_prompt(clean_text: str, context: str, participants: list[str],
-                      doubtful: list[str] | None = None) -> str:
+                      doubtful: list[str] | None = None,
+                      glossary: list[str] | None = None) -> str:
     """The instruction handed to the post-processing model.
 
     Order matters here. The first version led with the rules and then put
@@ -1049,6 +1051,12 @@ def _build_llm_prompt(clean_text: str, context: str, participants: list[str],
             "\nThe speech recogniser was unsure of these words:\n"
             f"{', '.join(doubtful)}\n")
 
+    glossary_block = ""
+    if glossary:
+        glossary_block = (
+            "\nKnown terms, spelled the way they should appear:\n"
+            f"{', '.join(glossary)}\n")
+
     return f"""You are repairing one chunk of an automatic speech-to-text transcript.
 
 Earlier chunks, for reference only. Do NOT continue them, do NOT copy from them:
@@ -1060,12 +1068,15 @@ The chunk to repair:
 <chunk>
 {clean_text}
 </chunk>
-{doubtful_block}{f"People in this meeting: {people}" if people else ""}
+{doubtful_block}{glossary_block}{f"People in this meeting: {people}" if people else ""}
 Rules:
-- Output the chunk again, repairing only what is clearly a recognition error.
+- Output the chunk again, repairing what is clearly a recognition error.
+- Where a word is a garbled attempt at one of the known terms above, replace it
+  with that term spelled exactly as listed. Use the context to judge which term
+  was meant; if none fits, leave the word alone.
 - Copy every other word exactly as it appears.
 - Do not continue the conversation. Do not add or remove sentences.
-- Do not change numbers or names.
+- Do not change numbers. Do not introduce names that are not listed above.
 - Keep the original language.
 - If nothing can be repaired with confidence, output the chunk unchanged.
 
@@ -1181,7 +1192,8 @@ def _postprocess_text(text: str, timestamp: str) -> str:
             # asked to improve a correct sentence, it removes the last one.
             if doubtful:
                 result = _llm_refine(clean_text, context,
-                                     get_remote_participants(), doubtful)
+                                     get_remote_participants(), doubtful,
+                                     _load_glossary())
                 accepted, reason = _llm_output_is_safe(clean_text, result)
                 if accepted and result.strip() != clean_text.strip():
                     print(f"[meeting] LLM fixed (unsure of: {', '.join(doubtful[:4])})"
@@ -1516,12 +1528,21 @@ end tell'''],
         return False
 
 
+MUTE_POLL_SECONDS = 5.0
+
+
 def mute_monitor_thread():
-    """Poll Zoom mute status every 2 seconds."""
+    """Poll Zoom mute status.
+
+    Each poll spawns osascript and walks Zoom's menus, so the interval is a
+    straight trade: cost against how long the mic keeps being recorded after
+    you mute. At 5s a meeting costs 720 polls an hour instead of 1800, and up
+    to five seconds of speech can still be captured after you hit mute.
+    """
     global _zoom_muted
     while not shutdown_event.is_set():
         _zoom_muted = _check_zoom_mute()
-        shutdown_event.wait(timeout=2.0)
+        shutdown_event.wait(timeout=MUTE_POLL_SECONDS)
 
 
 # -- Mic reader (sounddevice, for [You] labels) -------------------------------

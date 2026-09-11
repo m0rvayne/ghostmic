@@ -1696,3 +1696,38 @@ class TestDropReasons:
         finally:
             capture_mod._whisper_server_available = False
         cli.assert_called_once()
+
+
+class TestMutePolling:
+    def test_interval_is_five_seconds(self):
+        """Each poll spawns osascript; 5s halves the cost of an hour-long call
+        and widens the window where a muted mic is still recorded to 5s."""
+        assert capture_mod.MUTE_POLL_SECONDS == 5.0
+
+
+class TestPromptAllowsTermCorrection:
+    """The stage exists to fix garbled product names, among other things. The
+    first version forbade exactly that with "Do not change numbers or names"."""
+
+    def test_glossary_is_given_to_the_model(self):
+        p = capture_mod._build_llm_prompt("чанк", "контекст", [], ["мейнд"],
+                                          ["MindManager", "MCP"])
+        assert "MindManager, MCP" in p
+
+    def test_names_are_no_longer_frozen(self):
+        p = capture_mod._build_llm_prompt("чанк", "контекст", [], None,
+                                          ["MindManager"])
+        assert "Do not change numbers or names" not in p
+        assert "Do not change numbers." in p
+
+    def test_model_told_to_map_garbled_words_onto_terms(self):
+        p = capture_mod._build_llm_prompt("чанк", "контекст", [], None, ["MCP"])
+        assert "garbled attempt at one of the known terms" in p
+
+    def test_inventing_unlisted_names_still_forbidden(self):
+        p = capture_mod._build_llm_prompt("чанк", "контекст", [], None, ["MCP"])
+        assert "not introduce names that are not listed" in p
+
+    def test_no_glossary_means_no_block(self):
+        p = capture_mod._build_llm_prompt("чанк", "контекст", [], None, [])
+        assert "Known terms" not in p
