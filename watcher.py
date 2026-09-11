@@ -359,6 +359,7 @@ def start_whisper_server(ctx: WatcherContext):
         # — "кусоч" ends one segment and "ками" begins the next — and joining
         # them puts a space inside the word.
         "-sow",
+        "-mc", "0",  # no text context between segments — see capture.py
     ]
     if language and language != "auto":
         cmd.extend(["-l", language])

@@ -130,6 +130,7 @@ _LANGUAGE_CODES = {
 # the script actually written has to match the language claimed, and one
 # chunk is not enough to decide on.
 LANGUAGE_LOCK_VOTES = 3
+LANGUAGE_MIN_PROBABILITY = 0.7
 _CYRILLIC_LANGS = {"ru", "uk", "bg", "sr", "kk", "be", "mk"}
 _LATIN_LANGS = {"en", "de", "fr", "es", "it", "pt", "nl", "pl", "cs", "tr",
                 "sv", "no", "da", "fi", "ro", "hu"}
@@ -178,6 +179,11 @@ def _maybe_lock_language(result: "Transcription"):
         return  # too thin to draw a conclusion from
     if _script_contradicts(code, result.text):
         return  # "english" over Cyrillic text: believe the text
+    # whisper reports how sure it is; below this it is guessing, and a guess
+    # locked in for the whole meeting is how English hallucinations got into
+    # Russian calls. (Was 2966fed, lost in the whisper.cpp migration.)
+    if result.language_probability and result.language_probability < LANGUAGE_MIN_PROBABILITY:
+        return
 
     _language_votes.append(code)
     del _language_votes[:-LANGUAGE_LOCK_VOTES]
@@ -702,6 +708,7 @@ class Transcription:
     text: str
     tokens: list[tuple[str, float]] = field(default_factory=list)
     language: str = ""
+    language_probability: float = 0.0
     # Why this chunk produced nothing. Empty when it produced text, or when it
     # was genuinely silent — anything else must not be reported as silence.
     dropped_reason: str = ""
@@ -762,8 +769,10 @@ def _parse_verbose_json(payload: dict) -> Transcription:
             prob = word.get("probability")
             if raw.strip() and isinstance(prob, (int, float)):
                 tokens.append((raw, float(prob)))
-    return Transcription(text=text, tokens=tokens,
-                         language=str(payload.get("language") or ""))
+    return Transcription(
+        text=text, tokens=tokens,
+        language=str(payload.get("detected_language") or payload.get("language") or ""),
+        language_probability=float(payload.get("detected_language_probability") or 0.0))
 
 
 def _check_whisper_server() -> bool:
@@ -842,6 +851,12 @@ def _transcribe_via_cli(audio_np: np.ndarray, lang: str, prompt: str = "") -> Tr
             "--no-timestamps",
             "-t", "4",
             "-sow",  # split segments on words, not mid-word — see watcher.py
+            # Do not carry text context between segments. This is the
+            # condition_on_previous_text=False from d77a56f, which the move to
+            # whisper.cpp dropped: with context on, the decoder repeats itself
+            # ("Участники и термины: Участники и термины: …") and continues the
+            # initial prompt instead of transcribing.
+            "-mc", "0",
         ]
         if lang != "auto":
             whisper_cmd.extend(["-l", lang])
@@ -1719,6 +1734,21 @@ def main():
 
     signal.signal(signal.SIGINT, handle_signal)
     signal.signal(signal.SIGTERM, handle_signal)
+
+    # Audio has been piling up while the model loaded and the server was
+    # checked. Without this the first chunk is a minute long, which is the
+    # worst possible way to start — the backlog begins already behind.
+    # (Was 311fc4e, lost in the whisper.cpp migration.)
+    drained = 0
+    for q in (audio_queue, mic_queue):
+        while True:
+            try:
+                q.get_nowait()
+                drained += 1
+            except queue.Empty:
+                break
+    if drained:
+        print(f"[meeting] Discarded {drained}s buffered during startup", flush=True)
 
     # Start writer thread
     wt = threading.Thread(target=writer_thread, args=(model, has_mic), daemon=False)

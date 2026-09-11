@@ -8,6 +8,7 @@ import types
 from unittest.mock import MagicMock, patch, PropertyMock
 import numpy as np
 import pytest
+import pathlib
 from pathlib import Path
 
 # Mock sounddevice before importing capture
@@ -1731,3 +1732,62 @@ class TestPromptAllowsTermCorrection:
     def test_no_glossary_means_no_block(self):
         p = capture_mod._build_llm_prompt("чанк", "контекст", [], None, [])
         assert "Known terms" not in p
+
+
+class TestRestoredMigrationFixes:
+    """Three fixes that existed before the whisper.cpp migration and did not
+    survive it. Two were found by accident; these came from walking the
+    pre-migration commits deliberately."""
+
+    def test_no_text_context_between_segments(self):
+        """condition_on_previous_text=False from d77a56f. With context on, the
+        decoder repeats itself and continues the initial prompt."""
+        src = pathlib.Path(capture_mod.__file__).read_text(encoding="utf-8")
+        assert '"-mc", "0"' in src
+
+    def test_language_probability_is_read(self):
+        t = capture_mod._parse_verbose_json({
+            "text": "x", "detected_language": "russian",
+            "detected_language_probability": 0.93, "segments": []})
+        assert t.language == "russian"
+        assert t.language_probability == pytest.approx(0.93)
+
+    def test_language_probability_defaults_to_zero(self):
+        assert capture_mod._parse_verbose_json({"text": "x"}).language_probability == 0.0
+
+
+class TestLanguageConfidenceGate:
+    """2966fed: do not lock a language whisper is only guessing at."""
+
+    def setup_method(self):
+        capture_mod._detected_language = None
+        capture_mod._language_votes.clear()
+        self._saved = capture_mod.LANGUAGE
+        capture_mod.LANGUAGE = "auto"
+
+    def teardown_method(self):
+        capture_mod.LANGUAGE = self._saved
+        capture_mod._detected_language = None
+        capture_mod._language_votes.clear()
+
+    def _chunk(self, prob):
+        return capture_mod.Transcription(
+            "нормальная длинная реплика про бюджет",
+            [(f" w{i}", 0.95) for i in range(8)],
+            language="russian", language_probability=prob)
+
+    def test_confident_detection_locks(self):
+        for _ in range(capture_mod.LANGUAGE_LOCK_VOTES):
+            capture_mod._maybe_lock_language(self._chunk(0.95))
+        assert capture_mod.effective_language() == "ru"
+
+    def test_low_confidence_never_locks(self):
+        for _ in range(capture_mod.LANGUAGE_LOCK_VOTES * 3):
+            capture_mod._maybe_lock_language(self._chunk(0.4))
+        assert capture_mod.effective_language() == "auto"
+
+    def test_missing_probability_falls_back_to_the_other_checks(self):
+        """The CLI path reports no probability; votes and script still apply."""
+        for _ in range(capture_mod.LANGUAGE_LOCK_VOTES):
+            capture_mod._maybe_lock_language(self._chunk(0.0))
+        assert capture_mod.effective_language() == "ru"
